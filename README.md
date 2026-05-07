@@ -220,6 +220,7 @@ admin:change-me:admin,alice:alice-password:user,bob:bob-password:user
 | 同源校验 | 写操作会校验 `Origin` / `Referer`，并拒绝跨站 Fetch Metadata 子请求 |
 | 上传限制 | 默认单文件 100 MiB、单次上传 250 MiB、一次最多 50 个文件 |
 | API 限流 | Worker 实例内置每分钟请求上限，建议同时配合 Cloudflare WAF / Rate Limiting |
+| 登录防爆破 | 登录和注册同时按客户端与用户名组合限速，降低撞库和枚举风险 |
 | 分享密码 | 新分享链接密码使用 PBKDF2-SHA256 加盐哈希，旧 SHA-256 分享仍兼容验证 |
 | 下载防嗅探 | 下载响应设置 `nosniff`，并以附件形式返回 |
 
@@ -236,6 +237,7 @@ admin:change-me:admin,alice:alice-password:user,bob:bob-password:user
 | Environment variable | `MAX_SHARE_FILES` | `100` | 单个分享最多文件数 |
 | Environment variable | `API_RATE_LIMIT_PER_MINUTE` | `300` | 单个客户端每分钟 API 请求数 |
 | Environment variable | `AUTH_RATE_LIMIT_PER_MINUTE` | `60` | 单个客户端每分钟认证请求数 |
+| Environment variable | `AUTH_IDENTITY_RATE_LIMIT_PER_MINUTE` | `20` | 单个客户端对同一用户名每分钟登录/注册尝试数 |
 | Environment variable | `SHARE_VERIFY_RATE_LIMIT_PER_MINUTE` | `30` | 单个客户端每分钟分享密码验证次数 |
 | Environment variable | `ALLOW_UNCONFIGURED_AUTH` | `false` | 仅本地开发建议使用，不要在公网开启 |
 

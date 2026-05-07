@@ -1110,10 +1110,11 @@ export async function getShare(storage: ObjectStorage, code: string) {
 
 export async function verifySharePassword(share: ShareRecord, password: string | null | undefined) {
   if (!share.passwordHash) return true;
-  if (!password) return false;
+  const normalizedPassword = cleanText(password, 512);
+  if (!normalizedPassword) return false;
 
   if (!share.passwordHash.startsWith("pbkdf2-sha256:")) {
-    return (await sha256Hex(`${share.code}:${password}`)) === share.passwordHash;
+    return (await sha256Hex(`${share.code}:${normalizedPassword}`)) === share.passwordHash;
   }
 
   const [, iterationsValue, saltValue, hashValue] = share.passwordHash.split(":");
@@ -1121,9 +1122,13 @@ export async function verifySharePassword(share: ShareRecord, password: string |
   if (!Number.isSafeInteger(iterations) || iterations < 10_000 || !saltValue || !hashValue) return false;
 
   const encoder = new TextEncoder();
-  const key = await crypto.subtle.importKey("raw", encoder.encode(`${share.code}:${password}`), "PBKDF2", false, [
-    "deriveBits",
-  ]);
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(`${share.code}:${normalizedPassword}`),
+    "PBKDF2",
+    false,
+    ["deriveBits"],
+  );
   const expected = base64UrlToBytes(hashValue);
   const bits = await crypto.subtle.deriveBits(
     {
@@ -1141,16 +1146,21 @@ export async function verifySharePassword(share: ShareRecord, password: string |
 
 export async function verifyUserPasswordHash(user: string, passwordHash: string, password: string | null | undefined) {
   const normalizedUser = cleanUserName(user);
-  if (!normalizedUser || !password || !passwordHash.startsWith("pbkdf2-sha256:")) return false;
+  const normalizedPassword = cleanText(password, 512);
+  if (!normalizedUser || !normalizedPassword || !passwordHash.startsWith("pbkdf2-sha256:")) return false;
 
   const [, iterationsValue, saltValue, hashValue] = passwordHash.split(":");
   const iterations = Number(iterationsValue);
   if (!Number.isSafeInteger(iterations) || iterations < 10_000 || !saltValue || !hashValue) return false;
 
   const encoder = new TextEncoder();
-  const key = await crypto.subtle.importKey("raw", encoder.encode(`user:${normalizedUser}:${password}`), "PBKDF2", false, [
-    "deriveBits",
-  ]);
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(`user:${normalizedUser}:${normalizedPassword}`),
+    "PBKDF2",
+    false,
+    ["deriveBits"],
+  );
   const expected = base64UrlToBytes(hashValue);
   const bits = await crypto.subtle.deriveBits(
     {

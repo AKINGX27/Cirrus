@@ -56,6 +56,7 @@ interface AuthEnv {
   CSRF_SECRET?: string;
   API_RATE_LIMIT_PER_MINUTE?: string;
   AUTH_RATE_LIMIT_PER_MINUTE?: string;
+  AUTH_IDENTITY_RATE_LIMIT_PER_MINUTE?: string;
   SHARE_VERIFY_RATE_LIMIT_PER_MINUTE?: string;
   MAX_FILE_BYTES?: string;
   MAX_UPLOAD_BYTES?: string;
@@ -77,6 +78,7 @@ interface AuthSession {
   role: UserRole;
   baseRole: UserRole;
   configured: boolean;
+  csrfSeed: string;
 }
 
 type Bindings = StorageEnv & AuthEnv;
@@ -98,6 +100,7 @@ const DEFAULT_MAX_SELECTED_FILES = 500;
 const DEFAULT_MAX_SHARE_FILES = 100;
 const DEFAULT_API_RATE_LIMIT_PER_MINUTE = 300;
 const DEFAULT_AUTH_RATE_LIMIT_PER_MINUTE = 60;
+const DEFAULT_AUTH_IDENTITY_RATE_LIMIT_PER_MINUTE = 20;
 const DEFAULT_SHARE_VERIFY_RATE_LIMIT_PER_MINUTE = 30;
 const SESSION_COOKIE = "cirrus_session";
 const SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 14;
@@ -121,7 +124,7 @@ function jsonError(error: unknown) {
 
   if (error instanceof Error) {
     return {
-      message: error.message,
+      message: "服务暂时不可用",
       status: 500,
     };
   }
@@ -216,6 +219,12 @@ function base64UrlToBytes(value: string) {
   return bytes;
 }
 
+function runtimeSessionSecret() {
+  const globalScope = globalThis as typeof globalThis & { __cirrusRuntimeSessionSecret?: string };
+  globalScope.__cirrusRuntimeSessionSecret ??= randomToken(32);
+  return globalScope.__cirrusRuntimeSessionSecret;
+}
+
 function parseContentLength(value: string | null) {
   if (!value) return null;
   const length = Number(value);
@@ -261,6 +270,10 @@ function authRateLimit(env: Bindings) {
   return parsePositiveInt(env.AUTH_RATE_LIMIT_PER_MINUTE, DEFAULT_AUTH_RATE_LIMIT_PER_MINUTE, 10000);
 }
 
+function authIdentityRateLimit(env: Bindings) {
+  return parsePositiveInt(env.AUTH_IDENTITY_RATE_LIMIT_PER_MINUTE, DEFAULT_AUTH_IDENTITY_RATE_LIMIT_PER_MINUTE, 1000);
+}
+
 function shareVerifyRateLimit(env: Bindings) {
   return parsePositiveInt(env.SHARE_VERIFY_RATE_LIMIT_PER_MINUTE, DEFAULT_SHARE_VERIFY_RATE_LIMIT_PER_MINUTE, 10000);
 }
@@ -273,12 +286,29 @@ function requestHost(request: Request) {
   return request.headers.get("Host") || new URL(request.url).host;
 }
 
+function hostnameFromHost(host: string) {
+  try {
+    return new URL(`http://${host}`).hostname;
+  } catch {
+    return host.split(":")[0];
+  }
+}
+
+function isLocalHostname(hostname: string) {
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1" || hostname === "[::1]";
+}
+
 function requestClientKey(request: Request) {
   return (
     request.headers.get("CF-Connecting-IP") ||
     request.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() ||
     "unknown"
   );
+}
+
+function authIdentityKey(value: string) {
+  const normalized = value.trim().toLocaleLowerCase().replace(/[^a-z0-9_.-]+/g, "_").slice(0, 64);
+  return normalized || "blank";
 }
 
 function rateLimitResponse() {
@@ -320,15 +350,17 @@ function isCrossSiteSubresource(request: Request) {
   const dest = request.headers.get("Sec-Fetch-Dest");
 
   if (site !== "cross-site") return false;
-  if (mode === "navigate" && (dest === "document" || dest === "empty")) return false;
+  if (SAFE_METHODS.has(request.method) && mode === "navigate" && (dest === "document" || dest === "empty")) return false;
   return true;
 }
 
 function isSameOriginRequest(request: Request) {
   const expectedHost = requestHost(request);
+  let sawOriginHeader = false;
   for (const headerName of ["Origin", "Referer"]) {
     const value = request.headers.get(headerName);
     if (!value) continue;
+    sawOriginHeader = true;
     let url: URL;
     try {
       url = new URL(value);
@@ -336,16 +368,14 @@ function isSameOriginRequest(request: Request) {
       return false;
     }
     if (url.host !== expectedHost) return false;
-    if (url.protocol !== "https:" && url.hostname !== "localhost" && url.hostname !== "127.0.0.1") {
+    if (url.protocol !== "https:" && !(url.protocol === "http:" && isLocalHostname(url.hostname))) {
       return false;
     }
   }
-  return true;
-}
 
-async function sha256Bytes(input: string) {
-  const bytes = new TextEncoder().encode(input);
-  return new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  if (sawOriginHeader) return true;
+  if (request.headers.get("Sec-Fetch-Site") === "same-origin") return true;
+  return isLocalRequest(request) && !request.headers.has("Sec-Fetch-Site");
 }
 
 async function hmacSha256Base64Url(secret: string, input: string) {
@@ -357,13 +387,12 @@ async function hmacSha256Base64Url(secret: string, input: string) {
 }
 
 function sessionSecret(env: Bindings) {
-  return env.CSRF_SECRET?.trim() || env.AUTH_USERS?.trim() || "cirrus-dev-session-secret";
+  return env.CSRF_SECRET?.trim() || runtimeSessionSecret();
 }
 
 async function csrfTokenForSession(env: Bindings, session: AuthSession) {
   const secret = sessionSecret(env);
-  const bytes = await sha256Bytes(`${secret}:${session.name}:${session.role}`);
-  return base64Url(bytes);
+  return hmacSha256Base64Url(secret, `csrf:${session.name}:${session.role}:${session.csrfSeed}`);
 }
 
 function parseCookies(request: Request) {
@@ -378,28 +407,36 @@ function parseCookies(request: Request) {
 }
 
 async function createSessionCookieValue(env: Bindings, session: AuthSession) {
-  const payload = base64Url(new TextEncoder().encode(JSON.stringify({ user: session.name, createdAt: Date.now() })));
+  const payload = base64Url(
+    new TextEncoder().encode(
+      JSON.stringify({ user: session.name, csrfSeed: session.csrfSeed || "", createdAt: Date.now() }),
+    ),
+  );
   const signature = await hmacSha256Base64Url(sessionSecret(env), payload);
   return `${payload}.${signature}`;
 }
 
 async function verifySessionCookie(request: Request, env: Bindings) {
   const value = parseCookies(request).get(SESSION_COOKIE);
-  if (!value) return "";
+  if (!value) return null;
   const [payload, signature] = value.split(".");
-  if (!payload || !signature) return "";
+  if (!payload || !signature) return null;
   const expected = await hmacSha256Base64Url(sessionSecret(env), payload);
-  if (!timingSafeEqual(signature, expected)) return "";
+  if (!timingSafeEqual(signature, expected)) return null;
 
-  let data: { user?: unknown; createdAt?: unknown };
+  let data: { user?: unknown; csrfSeed?: unknown; createdAt?: unknown };
   try {
     data = JSON.parse(new TextDecoder().decode(base64UrlToBytes(payload)));
   } catch {
-    return "";
+    return null;
   }
-  if (typeof data.user !== "string" || typeof data.createdAt !== "number") return "";
-  if (Date.now() - data.createdAt > SESSION_MAX_AGE_SECONDS * 1000) return "";
-  return data.user;
+  if (typeof data.user !== "string" || typeof data.createdAt !== "number") return null;
+  if (typeof data.csrfSeed !== "string" || !/^[A-Za-z0-9_-]{16,128}$/.test(data.csrfSeed)) return null;
+  if (Date.now() - data.createdAt > SESSION_MAX_AGE_SECONDS * 1000) return null;
+  return {
+    user: data.user,
+    csrfSeed: data.csrfSeed,
+  };
 }
 
 function sessionCookieHeader(value: string) {
@@ -505,16 +542,22 @@ function unauthorizedResponse() {
   );
 }
 
-async function sessionForUserName(userName: string, env: Bindings, storage: ObjectStorage) {
+async function sessionForUserName(userName: string, env: Bindings, storage: ObjectStorage, csrfSeed = randomToken(24)) {
   const users = await allAuthUsers(env, storage);
   const user = users.find((item) => item.name === userName);
   if (!user) return null;
   const profiles = await getUserProfiles(storage).catch(() => ({} as UserProfiles));
   const role = profiles[user.name]?.role || user.role;
-  return { name: user.name, role, baseRole: user.role, configured: true } satisfies AuthSession;
+  return { name: user.name, role, baseRole: user.role, configured: true, csrfSeed } satisfies AuthSession;
 }
 
-async function authenticateCredentials(userName: string, password: string, env: Bindings, storage: ObjectStorage) {
+async function authenticateCredentials(
+  userName: string,
+  password: string,
+  env: Bindings,
+  storage: ObjectStorage,
+  csrfSeed = randomToken(24),
+) {
   const users = await allAuthUsers(env, storage);
   const user = users.find((item) => item.name === userName);
   if (!user) return null;
@@ -528,7 +571,7 @@ async function authenticateCredentials(userName: string, password: string, env: 
 
   const profiles = await getUserProfiles(storage).catch(() => ({} as UserProfiles));
   const role = profiles[user.name]?.role || user.role;
-  return { name: user.name, role, baseRole: user.role, configured: true } satisfies AuthSession;
+  return { name: user.name, role, baseRole: user.role, configured: true, csrfSeed } satisfies AuthSession;
 }
 
 function legacyBasicCredentials(request: Request) {
@@ -576,22 +619,21 @@ async function authenticate(request: Request, env: Bindings): Promise<AuthSessio
   const credentials = await getUserPasswordCredentials(storage).catch(() => ({} as UserPasswordCredentials));
   if (!configuredUsers.length && !Object.keys(credentials).length) {
     if (!truthyEnv(env.ALLOW_UNCONFIGURED_AUTH) && !isLocalRequest(request)) return null;
-    return { name: "admin", role: "admin", baseRole: "admin", configured: false };
+    return { name: "admin", role: "admin", baseRole: "admin", configured: false, csrfSeed: "unconfigured-local" };
   }
 
-  const cookieUser = await verifySessionCookie(request, env);
-  if (cookieUser) {
-    const session = await sessionForUserName(cookieUser, env, storage);
+  const cookieSession = await verifySessionCookie(request, env);
+  if (cookieSession) {
+    const session = await sessionForUserName(cookieSession.user, env, storage, cookieSession.csrfSeed);
     if (session) return session;
   }
 
   const basic = legacyBasicCredentials(request);
-  return basic ? authenticateCredentials(basic.name, basic.password, env, storage) : null;
+  return basic ? authenticateCredentials(basic.name, basic.password, env, storage, "legacy-basic-auth") : null;
 }
 
 function isLocalRequest(request: Request) {
-  const host = requestHost(request).split(":")[0];
-  return host === "localhost" || host === "127.0.0.1" || host === "::1";
+  return isLocalHostname(hostnameFromHost(requestHost(request)));
 }
 
 function fileMatchesVisibleTags(file: DriveFileMeta, tags: string[]) {
@@ -899,7 +941,13 @@ app.use("/api/*", async (c, next) => {
   const isPublicShareVerify = c.req.method === "POST" && /^\/api\/shares\/[^/]+\/verify$/.test(path);
   const isPublicShareDownload = c.req.method === "POST" && /^\/api\/shares\/[^/]+\/download$/.test(path);
   const isAuthEndpoint = c.req.method === "POST" && /^\/api\/auth\/(?:login|register|logout)$/.test(path);
+  if (isAuthEndpoint && !consumeRateLimit(`auth:${clientKey}`, authRateLimit(c.env))) {
+    return rateLimitResponse();
+  }
   if (isPublicShareVerify && !consumeRateLimit(`share-verify:${clientKey}:${path}`, shareVerifyRateLimit(c.env))) {
+    return rateLimitResponse();
+  }
+  if (isPublicShareDownload && !consumeRateLimit(`share-download:${clientKey}:${path}`, shareVerifyRateLimit(c.env))) {
     return rateLimitResponse();
   }
   if (isPublicShareRead || isPublicShareVerify || isPublicShareDownload || isAuthEndpoint) {
@@ -954,6 +1002,10 @@ app.post("/api/auth/login", async (c) => {
     const body = await jsonBody<{ username?: unknown; password?: unknown }>(c.req.raw, maxJsonBytes(c.env));
     const username = typeof body.username === "string" ? body.username : "";
     const password = typeof body.password === "string" ? body.password : "";
+    const identityKey = authIdentityKey(username);
+    if (!consumeRateLimit(`auth-identity:${requestClientKey(c.req.raw)}:${identityKey}`, authIdentityRateLimit(c.env))) {
+      return rateLimitResponse();
+    }
     const storage = createObjectStorage(c.env);
     const session = await authenticateCredentials(username, password, c.env, storage);
     if (!session) throw new AppError("用户名或密码不正确", 401);
@@ -976,12 +1028,16 @@ app.post("/api/auth/register", async (c) => {
     const username = typeof body.username === "string" ? body.username : "";
     const password = typeof body.password === "string" ? body.password : "";
     const confirmPassword = typeof body.confirmPassword === "string" ? body.confirmPassword : "";
+    const identityKey = authIdentityKey(username);
+    if (!consumeRateLimit(`auth-identity:${requestClientKey(c.req.raw)}:${identityKey}`, authIdentityRateLimit(c.env))) {
+      return rateLimitResponse();
+    }
     if (password !== confirmPassword) throw new AppError("两次输入的密码不一致");
 
     const storage = createObjectStorage(c.env);
     const existing = authUsers(c.env).map((user) => user.name);
     const account = await createRegisteredUser(storage, username, password, existing);
-    const session = await sessionForUserName(account.name, c.env, storage);
+    const session = await sessionForUserName(account.name, c.env, storage, randomToken(24));
     if (!session) throw new AppError("注册失败", 500);
 
     const cookie = await createSessionCookieValue(c.env, session);
@@ -3364,7 +3420,7 @@ const clientScript = String.raw`
 
       row.innerHTML =
         '<span class="file-name">' +
-          '<span class="file-icon">' + ext(file.name) + '</span>' +
+          '<span class="file-icon"></span>' +
           '<span>' +
             '<strong class="file-title"></strong>' +
             '<small class="file-size">' + formatSize(file.size) + '</small>' +
@@ -3375,6 +3431,7 @@ const clientScript = String.raw`
         '<span>' + formatDate(file.uploadedAt) + '</span>' +
         '<span>' + formatDate(file.lastDownloadedAt) + '</span>' +
         '<span>' + file.downloadCount + '</span>';
+      row.querySelector(".file-icon").textContent = ext(file.name);
       row.querySelector(".file-title").textContent = file.name;
       row.querySelector(".file-description").textContent = file.description || "无描述";
       renderTags(row.querySelector(".file-tags"), file.tags || []);

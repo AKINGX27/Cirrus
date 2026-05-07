@@ -733,7 +733,7 @@ export function createObjectStorage(env: StorageEnv): ObjectStorage {
 }
 
 function resolveS3Config(env: StorageEnv): S3Config {
-  const endpoint = optionalEnv(env.S3_ENDPOINT);
+  const endpoint = resolveS3Endpoint(optionalEnv(env.S3_ENDPOINT));
   const region = optionalEnv(env.S3_REGION) ?? optionalEnv(env.AWS_REGION) ?? optionalEnv(env.AWS_DEFAULT_REGION) ?? "us-east-1";
 
   return {
@@ -748,6 +748,34 @@ function resolveS3Config(env: StorageEnv): S3Config {
     sessionToken: optionalEnv(env.S3_SESSION_TOKEN) ?? optionalEnv(env.AWS_SESSION_TOKEN),
     forcePathStyle: parseBoolean(env.S3_FORCE_PATH_STYLE) ?? Boolean(endpoint),
   };
+}
+
+function resolveS3Endpoint(value: string | undefined) {
+  if (!value) return undefined;
+
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("S3_ENDPOINT must be a valid URL");
+  }
+
+  if (url.username || url.password) {
+    throw new Error("S3_ENDPOINT must not include credentials");
+  }
+
+  const isLocalhost =
+    url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "::1" || url.hostname === "[::1]";
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && isLocalhost)) {
+    throw new Error("S3_ENDPOINT must use https unless it points to localhost");
+  }
+
+  if (url.search || url.hash) {
+    throw new Error("S3_ENDPOINT must not include query string or hash");
+  }
+
+  url.pathname = url.pathname.replace(/\/+$/, "");
+  return url.toString().replace(/\/$/, "");
 }
 
 function requiredEnv(value: string | undefined, name: string) {
