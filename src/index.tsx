@@ -2122,7 +2122,7 @@ function ShareApp({ code, nonce }: { code: string; nonce: string }) {
         </a>
         <div class="share-heading">
           <p class="eyebrow">Share Link</p>
-          <h1>分享 {code}</h1>
+          <h1>分享文件</h1>
           <span id="share-expiry-note"></span>
         </div>
         <form id="share-password-form" class="password-card" hidden>

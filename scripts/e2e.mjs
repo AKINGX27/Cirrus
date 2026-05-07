@@ -566,7 +566,10 @@ test("registered users, profile settings, permissions, files, sharing, friends, 
     assert.equal(share.share.hasPassword, true);
 
     const shareHtml = await mf.dispatchFetch(`${origin}/s/qa-share`);
-    assertIncludes(await expectText(shareHtml, 200, "GET /s/:code"), 'data-app="share"');
+    const shareHtmlBody = await expectText(shareHtml, 200, "GET /s/:code");
+    assertIncludes(shareHtmlBody, 'data-app="share"');
+    assertIncludes(shareHtmlBody, "<h1>分享文件</h1>");
+    assert.ok(!shareHtmlBody.includes("<h1>分享 qa-share</h1>"), "share page should not display share code in title");
 
     const lockedShare = await app.request("/api/shares/qa-share");
     const lockedBody = await expectJson(lockedShare, 200, "locked share read");
