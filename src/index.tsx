@@ -5,6 +5,7 @@ import {
   addFriend,
   AppError,
   copyFiles,
+  createFileFromCompletedUpload,
   createFileFromUpload,
   createRegisteredUser,
   createShare,
@@ -59,6 +60,7 @@ interface AuthEnv {
   AUTH_IDENTITY_RATE_LIMIT_PER_MINUTE?: string;
   SHARE_VERIFY_RATE_LIMIT_PER_MINUTE?: string;
   MAX_FILE_BYTES?: string;
+  UPLOAD_CHUNK_BYTES?: string;
   MAX_JSON_BYTES?: string;
   MAX_SELECTED_FILES?: string;
   MAX_SHARE_FILES?: string;
@@ -257,9 +259,14 @@ function maxShareFiles(env: Bindings) {
   return parsePositiveInt(env.MAX_SHARE_FILES, DEFAULT_MAX_SHARE_FILES, 1000);
 }
 
+function uploadChunkBytes(env: Bindings) {
+  return parsePositiveInt(env.UPLOAD_CHUNK_BYTES, 16 * 1024 * 1024, 64 * 1024 * 1024);
+}
+
 function uploadLimits(env: Bindings) {
   return {
     maxFileBytes: maxFileBytes(env),
+    chunkBytes: uploadChunkBytes(env),
   };
 }
 
@@ -1312,6 +1319,137 @@ app.post("/api/files", async (c) => {
   }
 });
 
+app.post("/api/uploads/multipart", async (c) => {
+  try {
+    const body = await jsonBody<{
+      name?: unknown;
+      size?: unknown;
+      contentType?: unknown;
+      description?: unknown;
+      tags?: unknown;
+      expiresAt?: unknown;
+    }>(c.req.raw, maxJsonBytes(c.env));
+    const size = typeof body.size === "number" && Number.isFinite(body.size) ? body.size : -1;
+    if (size < 0) throw new AppError("文件大小无效");
+    if (size > maxFileBytes(c.env)) throw new AppError("单个文件过大", 413);
+
+    const storage = createObjectStorage(c.env);
+    if (!storage.createMultipartUpload) throw new AppError("当前存储后端不支持分片上传", 501);
+
+    const id = crypto.randomUUID();
+    const contentType = typeof body.contentType === "string" && body.contentType.trim() ? body.contentType : "application/octet-stream";
+    const upload = await storage.createMultipartUpload(objectKey(id), { contentType });
+    return c.json({
+      id,
+      uploadId: upload.uploadId,
+      partSize: uploadChunkBytes(c.env),
+      file: {
+        name: typeof body.name === "string" ? body.name : "",
+        size,
+        contentType,
+        description: cleanDescription(body.description),
+        tags: cleanTags(body.tags),
+        expiresAt: parseOptionalDate(body.expiresAt),
+      },
+    });
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
+
+app.put("/api/uploads/multipart/:id/:uploadId/:partNumber", async (c) => {
+  try {
+    const id = c.req.param("id");
+    const uploadId = c.req.param("uploadId");
+    const partNumber = Number(c.req.param("partNumber"));
+    if (!isUuid(id) || !uploadId || !Number.isSafeInteger(partNumber) || partNumber < 1 || partNumber > 10000) {
+      throw new AppError("分片参数无效");
+    }
+
+    const contentLength = parseContentLength(c.req.header("Content-Length") || null);
+    const chunkLimit = uploadChunkBytes(c.env) + 1024 * 1024;
+    if (contentLength !== null && contentLength > chunkLimit) {
+      throw new AppError("分片过大", 413);
+    }
+
+    const storage = createObjectStorage(c.env);
+    if (!storage.uploadMultipartPart) throw new AppError("当前存储后端不支持分片上传", 501);
+
+    const part = await storage.uploadMultipartPart({ key: objectKey(id), uploadId }, partNumber, await c.req.arrayBuffer());
+    return c.json(part);
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
+
+app.post("/api/uploads/multipart/:id/:uploadId/complete", async (c) => {
+  try {
+    const id = c.req.param("id");
+    const uploadId = c.req.param("uploadId");
+    if (!isUuid(id) || !uploadId) throw new AppError("分片参数无效");
+    const body = await jsonBody<{
+      name?: unknown;
+      size?: unknown;
+      contentType?: unknown;
+      expiresAt?: unknown;
+      description?: unknown;
+      tags?: unknown;
+      parts?: unknown;
+    }>(c.req.raw, maxJsonBytes(c.env));
+    const size = typeof body.size === "number" && Number.isFinite(body.size) ? body.size : -1;
+    if (size < 0) throw new AppError("文件大小无效");
+    if (size > maxFileBytes(c.env)) throw new AppError("单个文件过大", 413);
+
+    const parts = Array.isArray(body.parts)
+      ? body.parts
+          .map((part) => {
+            const value = part && typeof part === "object" ? (part as { partNumber?: unknown; etag?: unknown }) : {};
+            return {
+              partNumber: typeof value.partNumber === "number" ? value.partNumber : 0,
+              etag: typeof value.etag === "string" ? value.etag : "",
+            };
+          })
+          .filter((part) => Number.isSafeInteger(part.partNumber) && part.partNumber > 0 && part.etag)
+      : [];
+    if (!parts.length) throw new AppError("缺少上传分片");
+
+    const storage = createObjectStorage(c.env);
+    if (!storage.completeMultipartUpload) throw new AppError("当前存储后端不支持分片上传", 501);
+    await storage.completeMultipartUpload({ key: objectKey(id), uploadId }, parts);
+
+    const file = await createFileFromCompletedUpload(storage, {
+      id,
+      name: typeof body.name === "string" ? body.name : "",
+      size,
+      contentType: typeof body.contentType === "string" ? body.contentType : "",
+      expiresAt: parseOptionalDate(body.expiresAt),
+      description: cleanDescription(body.description),
+      tags: cleanTags(body.tags),
+      owner: c.get("session").name,
+    });
+    return c.json({ file: fileForClient(file) }, 201);
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
+
+app.delete("/api/uploads/multipart/:id/:uploadId", async (c) => {
+  try {
+    const id = c.req.param("id");
+    const uploadId = c.req.param("uploadId");
+    if (!isUuid(id) || !uploadId) throw new AppError("分片参数无效");
+    const storage = createObjectStorage(c.env);
+    await storage.abortMultipartUpload?.({ key: objectKey(id), uploadId });
+    return c.json({ ok: true });
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
+
 app.patch("/api/files/:id/description", async (c) => {
   try {
     const body = await jsonBody<{ description?: unknown }>(c.req.raw, maxJsonBytes(c.env));
@@ -1689,6 +1827,7 @@ function DriveApp({
       data-user={session.name}
       data-auth-configured={String(session.configured)}
       data-max-file-bytes={String(limits.maxFileBytes)}
+      data-upload-chunk-bytes={String(limits.chunkBytes)}
     >
       <aside class="side-rail">
         <a class="brand" href="/" aria-label="Cirrus Drive">
@@ -3236,7 +3375,8 @@ const clientScript = String.raw`
   const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || "";
   const appRoot = document.querySelector("[data-app='drive']");
   const uploadLimits = {
-    maxFileBytes: Number(appRoot?.dataset.maxFileBytes || 0)
+    maxFileBytes: Number(appRoot?.dataset.maxFileBytes || 0),
+    chunkBytes: Number(appRoot?.dataset.uploadChunkBytes || 0)
   };
   const isAdmin = appRoot?.dataset.role === "admin";
   const list = document.getElementById("file-list");
@@ -3376,7 +3516,7 @@ const clientScript = String.raw`
     uploadProgressText.value = "正在上传...";
   }
 
-  function uploadFormData(path, form) {
+  function uploadFormData(path, form, onProgress) {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open("POST", path);
@@ -3384,7 +3524,8 @@ const clientScript = String.raw`
       xhr.withCredentials = true;
       if (csrfToken) xhr.setRequestHeader("X-CSRF-Token", csrfToken);
       xhr.upload.addEventListener("progress", (event) => {
-        updateUploadProgress(event.loaded, event.lengthComputable ? event.total : 0);
+        if (onProgress) onProgress(event.loaded, event.lengthComputable ? event.total : 0);
+        else updateUploadProgress(event.loaded, event.lengthComputable ? event.total : 0);
       });
       xhr.addEventListener("load", () => {
         if (xhr.status >= 200 && xhr.status < 300) {
@@ -3405,6 +3546,117 @@ const clientScript = String.raw`
       xhr.addEventListener("abort", () => reject(new Error("上传已取消")));
       xhr.send(form);
     });
+  }
+
+  function requestWithProgress(method, path, body, onProgress) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open(method, path);
+      xhr.responseType = "json";
+      xhr.withCredentials = true;
+      if (csrfToken) xhr.setRequestHeader("X-CSRF-Token", csrfToken);
+      xhr.upload.addEventListener("progress", (event) => {
+        if (event.lengthComputable && onProgress) onProgress(event.loaded, event.total);
+      });
+      xhr.addEventListener("load", () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(xhr.response || {});
+          return;
+        }
+        let data = xhr.response || {};
+        if (typeof data !== "object") {
+          try {
+            data = JSON.parse(xhr.responseText || "{}");
+          } catch {
+            data = {};
+          }
+        }
+        reject(new Error(data.error || "上传失败"));
+      });
+      xhr.addEventListener("error", () => reject(new Error("网络错误，上传失败")));
+      xhr.addEventListener("abort", () => reject(new Error("上传已取消")));
+      xhr.send(body);
+    });
+  }
+
+  async function directUploadFile(item, context) {
+    const form = new FormData();
+    form.append("files", item.file);
+    form.append("description:0", item.description);
+    form.append("tags:0", tagsToText(item.tags));
+    form.append("expiresAt", getExpiryValue());
+    const start = context.doneBytes;
+    const data = await uploadFormData("/api/files", form, (loaded) => {
+      updateUploadProgress(start + loaded, context.totalBytes);
+    });
+    context.doneBytes += item.file.size;
+    updateUploadProgress(context.doneBytes, context.totalBytes);
+    return data.files?.[0] || null;
+  }
+
+  async function multipartUploadFile(item, context) {
+    const file = item.file;
+    const create = await api("/api/uploads/multipart", {
+      method: "POST",
+      body: JSON.stringify({
+        name: file.name,
+        size: file.size,
+        contentType: file.type || "application/octet-stream",
+        description: item.description,
+        tags: item.tags,
+        expiresAt: getExpiryValue()
+      })
+    });
+    const partSize = Math.max(5 * 1024 * 1024, Number(create.partSize || uploadLimits.chunkBytes || 16 * 1024 * 1024));
+    const parts = [];
+    let uploadedForFile = 0;
+
+    try {
+      for (let offset = 0, partNumber = 1; offset < file.size || (file.size === 0 && partNumber === 1); offset += partSize, partNumber += 1) {
+        const chunk = file.slice(offset, Math.min(offset + partSize, file.size));
+        const part = await requestWithProgress(
+          "PUT",
+          "/api/uploads/multipart/" +
+            encodeURIComponent(create.id) +
+            "/" +
+            encodeURIComponent(create.uploadId) +
+            "/" +
+            partNumber,
+          chunk,
+          (loaded) => {
+            updateUploadProgress(context.doneBytes + uploadedForFile + loaded, context.totalBytes);
+          }
+        );
+        parts.push(part);
+        uploadedForFile += chunk.size;
+        updateUploadProgress(context.doneBytes + uploadedForFile, context.totalBytes);
+      }
+
+      const completed = await api(
+        "/api/uploads/multipart/" + encodeURIComponent(create.id) + "/" + encodeURIComponent(create.uploadId) + "/complete",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            name: file.name,
+            size: file.size,
+            contentType: file.type || "application/octet-stream",
+            description: item.description,
+            tags: item.tags,
+            expiresAt: getExpiryValue(),
+            parts
+          })
+        },
+        201
+      );
+      context.doneBytes += file.size;
+      return completed.file;
+    } catch (error) {
+      await api("/api/uploads/multipart/" + encodeURIComponent(create.id) + "/" + encodeURIComponent(create.uploadId), {
+        method: "DELETE",
+        body: JSON.stringify({})
+      }).catch(() => {});
+      throw error;
+    }
   }
 
   async function logout() {
@@ -4002,19 +4254,22 @@ const clientScript = String.raw`
       return;
     }
 
-    const form = new FormData();
-    uploads.forEach((item, index) => {
-      form.append("files", item.file);
-      form.append("description:" + index, item.description);
-      form.append("tags:" + index, tagsToText(item.tags));
-    });
-    form.append("expiresAt", getExpiryValue());
-
     notify("正在上传 " + uploads.length + " 个文件...");
-    updateUploadProgress(0, uploads.reduce((sum, item) => sum + item.file.size, 0));
+    const uploadContext = {
+      doneBytes: 0,
+      totalBytes: uploads.reduce((sum, item) => sum + item.file.size, 0)
+    };
+    updateUploadProgress(0, uploadContext.totalBytes);
     setUploadBusy(true);
     try {
-      await uploadFormData("/api/files", form);
+      for (const item of uploads) {
+        uploadProgressText.value = "正在上传 " + item.file.name;
+        if (item.file.size < Math.max(5 * 1024 * 1024, uploadLimits.chunkBytes || 16 * 1024 * 1024)) {
+          await directUploadFile(item, uploadContext);
+        } else {
+          await multipartUploadFile(item, uploadContext);
+        }
+      }
       uploadProgress.value = 100;
       uploadProgressText.value = "上传完成，正在刷新...";
       uploadDialog.close();

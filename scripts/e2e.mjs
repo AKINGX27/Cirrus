@@ -117,7 +117,8 @@ async function createWorker(bindings = {}) {
       AUTH_RATE_LIMIT_PER_MINUTE: "10000",
       AUTH_IDENTITY_RATE_LIMIT_PER_MINUTE: "10000",
       SHARE_VERIFY_RATE_LIMIT_PER_MINUTE: "10000",
-      MAX_FILE_BYTES: "1048576",
+      MAX_FILE_BYTES: "10485760",
+      UPLOAD_CHUNK_BYTES: "5242880",
       ...bindings,
     },
     r2Buckets: ["DRIVE_BUCKET"],
@@ -208,7 +209,58 @@ function client(mf) {
     return expectJson(response, 201, "upload files");
   }
 
-  return { request, register, login, api, upload };
+  async function multipartUpload(session, file, fields = {}) {
+    const create = await api(
+      "/api/uploads/multipart",
+      session,
+      {
+        method: "POST",
+        json: {
+          name: file.name,
+          size: file.content.length,
+          contentType: file.type || "application/octet-stream",
+          description: fields.description || "",
+          tags: fields.tags || [],
+          expiresAt: fields.expiresAt || "",
+        },
+      },
+      200,
+    );
+    const chunkSize = fields.chunkSize || 5 * 1024 * 1024;
+    const parts = [];
+    for (let offset = 0, partNumber = 1; offset < file.content.length; offset += chunkSize, partNumber += 1) {
+      const chunk = file.content.slice(offset, offset + chunkSize);
+      const part = await api(
+        `/api/uploads/multipart/${create.id}/${encodeURIComponent(create.uploadId)}/${partNumber}`,
+        session,
+        {
+          method: "PUT",
+          body: new Blob([chunk], { type: file.type || "application/octet-stream" }),
+        },
+        200,
+      );
+      parts.push(part);
+    }
+    return api(
+      `/api/uploads/multipart/${create.id}/${encodeURIComponent(create.uploadId)}/complete`,
+      session,
+      {
+        method: "POST",
+        json: {
+          name: file.name,
+          size: file.content.length,
+          contentType: file.type || "application/octet-stream",
+          description: fields.description || "",
+          tags: fields.tags || [],
+          expiresAt: fields.expiresAt || "",
+          parts,
+        },
+      },
+      201,
+    );
+  }
+
+  return { request, register, login, api, upload, multipartUpload };
 }
 
 test("public auth shell and security headers", async () => {
@@ -400,12 +452,36 @@ test("registered users, profile settings, permissions, files, sharing, friends, 
     assert.equal(report.description, "first file description");
     assert.deepEqual(report.tags, ["alpha", "report"]);
 
+    const multipart = await app.multipartUpload(
+      normalUser,
+      {
+        name: "large.bin",
+        content: "a".repeat(5 * 1024 * 1024) + "tail",
+        type: "application/octet-stream",
+      },
+      {
+        description: "multipart description",
+        tags: ["multipart", "large"],
+        chunkSize: 5 * 1024 * 1024,
+      },
+    );
+    assert.equal(multipart.file.name, "large.bin");
+    assert.equal(multipart.file.description, "multipart description");
+    assert.deepEqual(multipart.file.tags, ["multipart", "large"]);
+
     const searchByDescription = await app.api("/api/files?q=first", normalUser);
     assert.deepEqual(searchByDescription.files.map((file) => file.id), [report.id]);
     const searchByExtension = await app.api("/api/files?q=md", normalUser);
     assert.deepEqual(searchByExtension.files.map((file) => file.id), [diagram.id]);
     const tagFilter = await app.api("/api/files?tag=alpha", normalUser);
     assert.deepEqual(tagFilter.files.map((file) => file.id), [report.id]);
+
+    const multipartDownload = await app.request(`/api/files/${multipart.file.id}/download`, {
+      cookie: normalUser.cookie,
+    });
+    const multipartBody = await multipartDownload.text();
+    assert.equal(multipartBody.length, 5 * 1024 * 1024 + 4, "multipart upload should download intact");
+    assert.equal(multipartBody.slice(-4), "tail", "multipart upload tail should be intact");
 
     const normalCannotAdmin = await app.request("/api/admin/overview", { cookie: normalUser.cookie });
     await expectJson(normalCannotAdmin, 403, "normal user cannot access admin overview");

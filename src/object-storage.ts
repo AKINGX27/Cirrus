@@ -45,6 +45,16 @@ export interface PutObjectOptions {
   contentType?: string;
 }
 
+export interface MultipartUploadHandle {
+  key: string;
+  uploadId: string;
+}
+
+export interface MultipartUploadPart {
+  partNumber: number;
+  etag: string;
+}
+
 export interface ObjectStorageListOptions {
   prefix: string;
   cursor?: string;
@@ -62,6 +72,14 @@ export interface ObjectStorage {
   put(key: string, value: ObjectStorageValue, options?: PutObjectOptions): Promise<void>;
   delete(key: string): Promise<void>;
   list(options: ObjectStorageListOptions): Promise<ObjectStorageListResult>;
+  createMultipartUpload?(key: string, options?: PutObjectOptions): Promise<MultipartUploadHandle>;
+  uploadMultipartPart?(
+    upload: MultipartUploadHandle,
+    partNumber: number,
+    value: ObjectStorageValue,
+  ): Promise<MultipartUploadPart>;
+  completeMultipartUpload?(upload: MultipartUploadHandle, parts: MultipartUploadPart[]): Promise<void>;
+  abortMultipartUpload?(upload: MultipartUploadHandle): Promise<void>;
 }
 
 class R2StoredObject implements StoredObject {
@@ -110,6 +128,32 @@ class R2ObjectStorage implements ObjectStorage {
       cursor: listed.truncated ? listed.cursor : undefined,
       truncated: listed.truncated,
     };
+  }
+
+  async createMultipartUpload(key: string, options?: PutObjectOptions) {
+    const upload = await this.bucket.createMultipartUpload(key, {
+      httpMetadata: options?.contentType
+        ? {
+            contentType: options.contentType,
+          }
+        : undefined,
+    });
+    return { key: upload.key, uploadId: upload.uploadId };
+  }
+
+  async uploadMultipartPart(upload: MultipartUploadHandle, partNumber: number, value: ObjectStorageValue) {
+    const resumed = this.bucket.resumeMultipartUpload(upload.key, upload.uploadId);
+    return resumed.uploadPart(partNumber, value as ReadableStream | ArrayBuffer | ArrayBufferView | string | Blob);
+  }
+
+  async completeMultipartUpload(upload: MultipartUploadHandle, parts: MultipartUploadPart[]) {
+    const resumed = this.bucket.resumeMultipartUpload(upload.key, upload.uploadId);
+    await resumed.complete(parts);
+  }
+
+  async abortMultipartUpload(upload: MultipartUploadHandle) {
+    const resumed = this.bucket.resumeMultipartUpload(upload.key, upload.uploadId);
+    await resumed.abort();
   }
 }
 
@@ -225,6 +269,76 @@ class S3ObjectStorage implements ObjectStorage {
       cursor: root?.NextContinuationToken ? String(root.NextContinuationToken) : undefined,
       truncated: String(root?.IsTruncated ?? "false") === "true",
     };
+  }
+
+  async createMultipartUpload(key: string, options?: PutObjectOptions) {
+    const url = this.objectUrl(key);
+    url.search = "?uploads";
+    const headers: HeadersInit = options?.contentType
+      ? {
+          "Content-Type": options.contentType,
+        }
+      : {};
+    const response = await this.client.fetch(url, {
+      method: "POST",
+      headers,
+    });
+    await this.assertOk(response, `create multipart upload ${key}`);
+
+    const parsed = this.parser.parse(await response.text());
+    const root = parsed?.InitiateMultipartUploadResult ?? parsed;
+    const uploadId = String(root?.UploadId ?? "");
+    if (!uploadId) throw new Error("S3 create multipart upload did not return UploadId");
+    return { key, uploadId };
+  }
+
+  async uploadMultipartPart(upload: MultipartUploadHandle, partNumber: number, value: ObjectStorageValue) {
+    const url = this.objectUrl(upload.key);
+    url.searchParams.set("partNumber", String(partNumber));
+    url.searchParams.set("uploadId", upload.uploadId);
+    const response = await this.client.fetch(url, {
+      method: "PUT",
+      headers: {
+        "X-Amz-Content-Sha256": "UNSIGNED-PAYLOAD",
+      },
+      body: value as BodyInit,
+    });
+    await this.assertOk(response, `upload part ${partNumber} for ${upload.key}`);
+
+    const etag = response.headers.get("ETag")?.replace(/^"|"$/g, "") || "";
+    if (!etag) throw new Error("S3 upload part did not return ETag");
+    return { partNumber, etag };
+  }
+
+  async completeMultipartUpload(upload: MultipartUploadHandle, parts: MultipartUploadPart[]) {
+    const url = this.objectUrl(upload.key);
+    url.searchParams.set("uploadId", upload.uploadId);
+    const body =
+      "<CompleteMultipartUpload>" +
+      parts
+        .slice()
+        .sort((a, b) => a.partNumber - b.partNumber)
+        .map((part) => `<Part><PartNumber>${part.partNumber}</PartNumber><ETag>${escapeXml(part.etag)}</ETag></Part>`)
+        .join("") +
+      "</CompleteMultipartUpload>";
+    const response = await this.client.fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/xml",
+      },
+      body,
+    });
+    await this.assertOk(response, `complete multipart upload ${upload.key}`);
+  }
+
+  async abortMultipartUpload(upload: MultipartUploadHandle) {
+    const url = this.objectUrl(upload.key);
+    url.searchParams.set("uploadId", upload.uploadId);
+    const response = await this.client.fetch(url, {
+      method: "DELETE",
+    });
+    if (response.status === 404) return;
+    await this.assertOk(response, `abort multipart upload ${upload.key}`);
   }
 
   private bucketUrl() {
@@ -500,6 +614,32 @@ class D1StructuredStorage implements ObjectStorage {
       cursor: (result.results || []).length === limit ? String(offset + limit) : undefined,
       truncated: (result.results || []).length === limit,
     };
+  }
+
+  async createMultipartUpload(key: string, options?: PutObjectOptions) {
+    if (structuredKey(key) || !this.objects.createMultipartUpload) {
+      throw new Error("multipart uploads are only supported for object data");
+    }
+    return this.objects.createMultipartUpload(key, options);
+  }
+
+  async uploadMultipartPart(upload: MultipartUploadHandle, partNumber: number, value: ObjectStorageValue) {
+    if (!this.objects.uploadMultipartPart) {
+      throw new Error("multipart uploads are not supported by this storage backend");
+    }
+    return this.objects.uploadMultipartPart(upload, partNumber, value);
+  }
+
+  async completeMultipartUpload(upload: MultipartUploadHandle, parts: MultipartUploadPart[]) {
+    if (!this.objects.completeMultipartUpload) {
+      throw new Error("multipart uploads are not supported by this storage backend");
+    }
+    return this.objects.completeMultipartUpload(upload, parts);
+  }
+
+  async abortMultipartUpload(upload: MultipartUploadHandle) {
+    if (!this.objects.abortMultipartUpload) return;
+    await this.objects.abortMultipartUpload(upload);
   }
 
   private async ensureReady() {
@@ -876,6 +1016,16 @@ function encodeKey(key: string) {
 function joinPath(basePath: string, next: string) {
   const base = basePath.replace(/\/+$/, "");
   return `${base}/${encodeURIComponent(next)}`;
+}
+
+function escapeXml(value: string) {
+  return value.replace(/[<>&'"]/g, (character) => {
+    if (character === "<") return "&lt;";
+    if (character === ">") return "&gt;";
+    if (character === "&") return "&amp;";
+    if (character === "'") return "&apos;";
+    return "&quot;";
+  });
 }
 
 function metaKey(id: string) {

@@ -426,6 +426,37 @@ export async function createFileFromUpload(
   return meta;
 }
 
+export async function createFileFromCompletedUpload(
+  storage: ObjectStorage,
+  input: {
+    id: string;
+    name: string;
+    size: number;
+    contentType?: string;
+    expiresAt: string | null;
+    description: string;
+    tags: string[];
+    owner: string;
+  },
+) {
+  const meta: DriveFileMeta = {
+    id: input.id,
+    name: cleanFileName(input.name),
+    description: cleanDescription(input.description),
+    tags: cleanTags(input.tags),
+    owner: cleanOwner(input.owner),
+    size: typeof input.size === "number" && Number.isFinite(input.size) ? input.size : 0,
+    contentType: cleanContentType(input.contentType),
+    uploadedAt: new Date().toISOString(),
+    expiresAt: input.expiresAt,
+    lastDownloadedAt: null,
+    downloadCount: 0,
+  };
+
+  await saveFileMeta(storage, meta);
+  return meta;
+}
+
 export async function renameFile(storage: ObjectStorage, id: string, name: string) {
   const meta = await getActiveFileMeta(storage, id);
   if (!meta) throw new AppError("文件不存在", 404);
