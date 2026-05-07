@@ -59,8 +59,6 @@ interface AuthEnv {
   AUTH_IDENTITY_RATE_LIMIT_PER_MINUTE?: string;
   SHARE_VERIFY_RATE_LIMIT_PER_MINUTE?: string;
   MAX_FILE_BYTES?: string;
-  MAX_UPLOAD_BYTES?: string;
-  MAX_FILES_PER_UPLOAD?: string;
   MAX_JSON_BYTES?: string;
   MAX_SELECTED_FILES?: string;
   MAX_SHARE_FILES?: string;
@@ -93,8 +91,6 @@ const app = new Hono<{ Bindings: Bindings; Variables: AppVariables }>();
 
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 const DEFAULT_MAX_FILE_BYTES = 4 * 1024 * 1024 * 1024;
-const DEFAULT_MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024;
-const DEFAULT_MAX_FILES_PER_UPLOAD = 50;
 const DEFAULT_MAX_JSON_BYTES = 64 * 1024;
 const DEFAULT_MAX_SELECTED_FILES = 500;
 const DEFAULT_MAX_SHARE_FILES = 100;
@@ -249,14 +245,6 @@ function maxFileBytes(env: Bindings) {
   return parsePositiveInt(env.MAX_FILE_BYTES, DEFAULT_MAX_FILE_BYTES);
 }
 
-function maxUploadBytes(env: Bindings) {
-  return parsePositiveInt(env.MAX_UPLOAD_BYTES, DEFAULT_MAX_UPLOAD_BYTES);
-}
-
-function maxFilesPerUpload(env: Bindings) {
-  return parsePositiveInt(env.MAX_FILES_PER_UPLOAD, DEFAULT_MAX_FILES_PER_UPLOAD, 200);
-}
-
 function maxJsonBytes(env: Bindings) {
   return parsePositiveInt(env.MAX_JSON_BYTES, DEFAULT_MAX_JSON_BYTES, 1024 * 1024);
 }
@@ -272,8 +260,6 @@ function maxShareFiles(env: Bindings) {
 function uploadLimits(env: Bindings) {
   return {
     maxFileBytes: maxFileBytes(env),
-    maxUploadBytes: maxUploadBytes(env),
-    maxFilesPerUpload: maxFilesPerUpload(env),
   };
 }
 
@@ -1295,25 +1281,12 @@ app.patch("/api/notifications/read", async (c) => {
 
 app.post("/api/files", async (c) => {
   try {
-    const contentLength = parseContentLength(c.req.header("Content-Length") || null);
-    if (contentLength !== null && contentLength > maxUploadBytes(c.env)) {
-      throw new AppError("上传内容过大", 413);
-    }
-
     const form = await c.req.formData();
     const expiresAt = parseOptionalDate(form.get("expiresAt"));
     const files = (form.getAll("files") as unknown[]).filter(isUploadedFile);
 
     if (!files.length) {
       throw new AppError("请选择要上传的文件");
-    }
-    if (files.length > maxFilesPerUpload(c.env)) {
-      throw new AppError("一次上传的文件过多", 413);
-    }
-
-    const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
-    if (totalBytes > maxUploadBytes(c.env)) {
-      throw new AppError("上传内容过大", 413);
     }
     const perFileLimit = maxFileBytes(c.env);
     if (files.some((file) => file.size > perFileLimit)) {
@@ -1716,8 +1689,6 @@ function DriveApp({
       data-user={session.name}
       data-auth-configured={String(session.configured)}
       data-max-file-bytes={String(limits.maxFileBytes)}
-      data-max-upload-bytes={String(limits.maxUploadBytes)}
-      data-max-files-per-upload={String(limits.maxFilesPerUpload)}
     >
       <aside class="side-rail">
         <a class="brand" href="/" aria-label="Cirrus Drive">
@@ -3250,9 +3221,7 @@ const clientScript = String.raw`
   const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || "";
   const appRoot = document.querySelector("[data-app='drive']");
   const uploadLimits = {
-    maxFileBytes: Number(appRoot?.dataset.maxFileBytes || 0),
-    maxUploadBytes: Number(appRoot?.dataset.maxUploadBytes || 0),
-    maxFilesPerUpload: Number(appRoot?.dataset.maxFilesPerUpload || 0)
+    maxFileBytes: Number(appRoot?.dataset.maxFileBytes || 0)
   };
   const isAdmin = appRoot?.dataset.role === "admin";
   const list = document.getElementById("file-list");
@@ -3998,13 +3967,6 @@ const clientScript = String.raw`
 
   function validatePendingUploads() {
     if (!pendingUploads.length) return "";
-    if (uploadLimits.maxFilesPerUpload && pendingUploads.length > uploadLimits.maxFilesPerUpload) {
-      return "一次最多上传 " + uploadLimits.maxFilesPerUpload + " 个文件";
-    }
-    const totalBytes = pendingUploads.reduce((sum, item) => sum + item.file.size, 0);
-    if (uploadLimits.maxUploadBytes && totalBytes > uploadLimits.maxUploadBytes) {
-      return "单次上传总大小不能超过 " + formatSize(uploadLimits.maxUploadBytes);
-    }
     const oversized = pendingUploads.find((item) => uploadLimits.maxFileBytes && item.file.size > uploadLimits.maxFileBytes);
     if (oversized) {
       return "文件 " + oversized.file.name + " 超过单文件上限 " + formatSize(uploadLimits.maxFileBytes);

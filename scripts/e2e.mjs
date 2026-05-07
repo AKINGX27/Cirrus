@@ -118,8 +118,6 @@ async function createWorker(bindings = {}) {
       AUTH_IDENTITY_RATE_LIMIT_PER_MINUTE: "10000",
       SHARE_VERIFY_RATE_LIMIT_PER_MINUTE: "10000",
       MAX_FILE_BYTES: "1048576",
-      MAX_UPLOAD_BYTES: "4194304",
-      MAX_FILES_PER_UPLOAD: "20",
       ...bindings,
     },
     r2Buckets: ["DRIVE_BUCKET"],

@@ -218,7 +218,7 @@ admin:change-me:admin,alice:alice-password:user,bob:bob-password:user
 | CSP | 使用 nonce 限制脚本来源，禁止外站脚本、插件对象、跨站嵌入 |
 | CSRF | 所有登录后的写操作都必须携带同源页面生成的 `X-CSRF-Token` |
 | 同源校验 | 写操作会校验 `Origin` / `Referer`，并拒绝跨站 Fetch Metadata 子请求 |
-| 上传限制 | 默认单文件 100 MiB、单次上传 250 MiB、一次最多 50 个文件 |
+| 上传限制 | 默认单文件 4 GiB，不限制单次上传总大小和文件数量 |
 | API 限流 | Worker 实例内置每分钟请求上限，建议同时配合 Cloudflare WAF / Rate Limiting |
 | 登录防爆破 | 登录和注册同时按客户端与用户名组合限速，降低撞库和枚举风险 |
 | 分享密码 | 新分享链接密码使用 PBKDF2-SHA256 加盐哈希，旧 SHA-256 分享仍兼容验证 |
@@ -230,8 +230,6 @@ admin:change-me:admin,alice:alice-password:user,bob:bob-password:user
 | --- | --- | --- | --- |
 | Secret | `CSRF_SECRET` | 无 | 随机长字符串，用于 CSRF token 派生 |
 | Environment variable | `MAX_FILE_BYTES` | `4294967296` | 单文件最大字节数，默认 4 GiB |
-| Environment variable | `MAX_UPLOAD_BYTES` | `4294967296` | 单次上传总字节数，默认 4 GiB |
-| Environment variable | `MAX_FILES_PER_UPLOAD` | `50` | 单次上传文件数量 |
 | Environment variable | `MAX_JSON_BYTES` | `65536` | JSON 请求体最大字节数 |
 | Environment variable | `MAX_SELECTED_FILES` | `500` | 批量下载、删除、复制最多文件数 |
 | Environment variable | `MAX_SHARE_FILES` | `100` | 单个分享最多文件数 |
