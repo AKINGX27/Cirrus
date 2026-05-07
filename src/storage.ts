@@ -687,17 +687,33 @@ export function userAccountsFromCredentials(credentials: UserPasswordCredentials
 export async function createRegisteredUser(storage: ObjectStorage, user: string, password: string, existingUsers: string[]) {
   const normalizedUser = cleanUserName(user);
   if (!normalizedUser) throw new AppError("用户名只能包含字母、数字、下划线、短横线和点号，长度 1-64 位");
-  if (existingUsers.map(cleanUserName).includes(normalizedUser)) throw new AppError("用户名已存在", 409);
+  const normalizedExistingUsers = existingUsers.map(cleanUserName).filter(Boolean);
+  if (normalizedExistingUsers.includes(normalizedUser)) throw new AppError("用户名已存在", 409);
 
   const credentials = await getUserPasswordCredentials(storage);
   if (credentials[normalizedUser]) throw new AppError("用户名已存在", 409);
+  const isFirstUser = normalizedExistingUsers.length === 0 && Object.keys(credentials).length === 0;
+
   credentials[normalizedUser] = {
     passwordHash: await hashUserPassword(normalizedUser, password),
     updatedAt: new Date().toISOString(),
   };
   await saveUserPasswordCredentials(storage, credentials);
-  await ensureUserProfiles(storage, [normalizedUser]);
-  return userAccountsFromCredentials(credentials)[normalizedUser];
+
+  const profiles = await ensureUserProfiles(storage, [normalizedUser]);
+  if (isFirstUser) {
+    profiles[normalizedUser] = {
+      ...normalizeUserProfile(profiles[normalizedUser]),
+      role: "admin",
+      updatedAt: new Date().toISOString(),
+    };
+    await saveUserProfiles(storage, profiles);
+  }
+
+  return {
+    ...userAccountsFromCredentials(credentials)[normalizedUser],
+    role: isFirstUser ? "admin" : "user",
+  };
 }
 
 function nicknameOwner(profiles: UserProfiles, nickname: string, currentUser: string) {
