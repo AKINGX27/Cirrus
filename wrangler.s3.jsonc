@@ -8,11 +8,6 @@
     "enabled": true
   },
   "vars": {
-    "STORAGE_BACKEND": "r2"
-  },
-  "r2_buckets": [
-    {
-      "binding": "DRIVE_BUCKET"
-    }
-  ]
+    "STORAGE_BACKEND": "s3"
+  }
 }

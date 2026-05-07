@@ -1,3 +1,5 @@
+import type { ObjectStorage } from "./object-storage";
+
 const OBJECT_PREFIX = "objects/";
 const META_PREFIX = "meta/";
 const SHARE_PREFIX = "shares/";
@@ -5,6 +7,7 @@ const SHARE_PREFIX = "shares/";
 export interface DriveFileMeta {
   id: string;
   name: string;
+  description: string;
   size: number;
   contentType: string;
   uploadedAt: string;
@@ -58,6 +61,11 @@ export function cleanFileName(name: string) {
   return cleaned || "untitled";
 }
 
+export function cleanDescription(value: unknown) {
+  if (typeof value !== "string") return "";
+  return value.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 500);
+}
+
 export function isExpired(expiresAt: string | null | undefined, now = Date.now()) {
   if (!expiresAt) return false;
   const time = Date.parse(expiresAt);
@@ -73,8 +81,8 @@ export function parseOptionalDate(value: unknown) {
   return date.toISOString();
 }
 
-async function readJson<T>(bucket: R2Bucket, key: string): Promise<T | null> {
-  const object = await bucket.get(key);
+async function readJson<T>(storage: ObjectStorage, key: string): Promise<T | null> {
+  const object = await storage.get(key);
   if (!object) return null;
 
   try {
@@ -84,52 +92,50 @@ async function readJson<T>(bucket: R2Bucket, key: string): Promise<T | null> {
   }
 }
 
-async function writeJson(bucket: R2Bucket, key: string, value: unknown) {
-  await bucket.put(key, JSON.stringify(value), {
-    httpMetadata: {
-      contentType: "application/json; charset=utf-8",
-    },
+async function writeJson(storage: ObjectStorage, key: string, value: unknown) {
+  await storage.put(key, JSON.stringify(value), {
+    contentType: "application/json; charset=utf-8",
   });
 }
 
-export async function saveFileMeta(bucket: R2Bucket, meta: DriveFileMeta) {
-  await writeJson(bucket, metaKey(meta.id), meta);
+export async function saveFileMeta(storage: ObjectStorage, meta: DriveFileMeta) {
+  await writeJson(storage, metaKey(meta.id), meta);
 }
 
-export async function deleteDriveFile(bucket: R2Bucket, id: string) {
-  await Promise.all([bucket.delete(objectKey(id)), bucket.delete(metaKey(id))]);
+export async function deleteDriveFile(storage: ObjectStorage, id: string) {
+  await Promise.all([storage.delete(objectKey(id)), storage.delete(metaKey(id))]);
 }
 
-async function readFileMeta(bucket: R2Bucket, id: string) {
-  return readJson<DriveFileMeta>(bucket, metaKey(id));
+async function readFileMeta(storage: ObjectStorage, id: string) {
+  return readJson<DriveFileMeta>(storage, metaKey(id));
 }
 
-export async function getActiveFileMeta(bucket: R2Bucket, id: string) {
-  const meta = await readFileMeta(bucket, id);
+export async function getActiveFileMeta(storage: ObjectStorage, id: string) {
+  const meta = await readFileMeta(storage, id);
   if (!meta) return null;
 
   if (isExpired(meta.expiresAt)) {
-    await deleteDriveFile(bucket, id);
+    await deleteDriveFile(storage, id);
     return null;
   }
 
   return meta;
 }
 
-export async function listFiles(bucket: R2Bucket) {
+export async function listFiles(storage: ObjectStorage) {
   const files: DriveFileMeta[] = [];
   const expiredIds: string[] = [];
   let cursor: string | undefined;
 
   do {
-    const listed = await bucket.list({
+    const listed = await storage.list({
       prefix: META_PREFIX,
       cursor,
       limit: 1000,
     });
 
     const batch = await Promise.all(
-      listed.objects.map((object) => readJson<DriveFileMeta>(bucket, object.key)),
+      listed.objects.map((object) => readJson<DriveFileMeta>(storage, object.key)),
     );
 
     for (const meta of batch) {
@@ -145,16 +151,17 @@ export async function listFiles(bucket: R2Bucket) {
   } while (cursor);
 
   if (expiredIds.length) {
-    await Promise.all(expiredIds.map((id) => deleteDriveFile(bucket, id)));
+    await Promise.all(expiredIds.map((id) => deleteDriveFile(storage, id)));
   }
 
   return files.sort((a, b) => Date.parse(b.uploadedAt) - Date.parse(a.uploadedAt));
 }
 
 export async function createFileFromUpload(
-  bucket: R2Bucket,
+  storage: ObjectStorage,
   file: File,
   expiresAt: string | null,
+  description: string,
 ) {
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
@@ -164,6 +171,7 @@ export async function createFileFromUpload(
   const meta: DriveFileMeta = {
     id,
     name,
+    description: cleanDescription(description),
     size: file.size,
     contentType,
     uploadedAt: now,
@@ -172,35 +180,28 @@ export async function createFileFromUpload(
     downloadCount: 0,
   };
 
-  await bucket.put(objectKey(id), file, {
-    httpMetadata: {
-      contentType,
-    },
-    customMetadata: {
-      name,
-      uploadedAt: now,
-      expiresAt: expiresAt ?? "",
-    },
+  await storage.put(objectKey(id), file, {
+    contentType,
   });
-  await saveFileMeta(bucket, meta);
+  await saveFileMeta(storage, meta);
 
   return meta;
 }
 
-export async function renameFile(bucket: R2Bucket, id: string, name: string) {
-  const meta = await getActiveFileMeta(bucket, id);
+export async function renameFile(storage: ObjectStorage, id: string, name: string) {
+  const meta = await getActiveFileMeta(storage, id);
   if (!meta) throw new AppError("文件不存在", 404);
 
   const next: DriveFileMeta = {
     ...meta,
     name: cleanFileName(name),
   };
-  await saveFileMeta(bucket, next);
+  await saveFileMeta(storage, next);
   return next;
 }
 
-export async function incrementDownload(bucket: R2Bucket, id: string) {
-  const current = await getActiveFileMeta(bucket, id);
+export async function incrementDownload(storage: ObjectStorage, id: string) {
+  const current = await getActiveFileMeta(storage, id);
   if (!current) return null;
 
   const next: DriveFileMeta = {
@@ -208,7 +209,7 @@ export async function incrementDownload(bucket: R2Bucket, id: string) {
     downloadCount: current.downloadCount + 1,
     lastDownloadedAt: new Date().toISOString(),
   };
-  await saveFileMeta(bucket, next);
+  await saveFileMeta(storage, next);
   return next;
 }
 
@@ -220,14 +221,14 @@ function copyName(name: string) {
   return `${name} - 副本`;
 }
 
-export async function copyFiles(bucket: R2Bucket, ids: string[]) {
+export async function copyFiles(storage: ObjectStorage, ids: string[]) {
   const copied: DriveFileMeta[] = [];
 
   for (const id of ids) {
-    const source = await getActiveFileMeta(bucket, id);
+    const source = await getActiveFileMeta(storage, id);
     if (!source) continue;
 
-    const object = await bucket.get(objectKey(source.id));
+    const object = await storage.get(objectKey(source.id));
     if (!object?.body) continue;
 
     const nextId = crypto.randomUUID();
@@ -241,17 +242,10 @@ export async function copyFiles(bucket: R2Bucket, ids: string[]) {
       downloadCount: 0,
     };
 
-    await bucket.put(objectKey(nextId), object.body, {
-      httpMetadata: {
-        contentType: source.contentType,
-      },
-      customMetadata: {
-        name: next.name,
-        uploadedAt,
-        expiresAt: next.expiresAt ?? "",
-      },
+    await storage.put(objectKey(nextId), object.body, {
+      contentType: source.contentType,
     });
-    await saveFileMeta(bucket, next);
+    await saveFileMeta(storage, next);
     copied.push(next);
   }
 
@@ -283,21 +277,21 @@ async function hashPassword(code: string, password: string) {
   return sha256Hex(`${code}:${password}`);
 }
 
-export async function createShare(bucket: R2Bucket, input: CreateShareInput) {
+export async function createShare(storage: ObjectStorage, input: CreateShareInput) {
   const fileIds = Array.from(new Set(input.fileIds.filter(Boolean)));
   if (!fileIds.length) throw new AppError("请选择要分享的文件");
 
   const activeFiles = (
-    await Promise.all(fileIds.map((id) => getActiveFileMeta(bucket, id)))
+    await Promise.all(fileIds.map((id) => getActiveFileMeta(storage, id)))
   ).filter(Boolean) as DriveFileMeta[];
   if (!activeFiles.length) throw new AppError("可分享的文件不存在", 404);
 
   let code = input.code ? normalizeShareCode(input.code) : randomShareCode();
-  if (input.code && (await readJson<ShareRecord>(bucket, shareKey(code)))) {
+  if (input.code && (await readJson<ShareRecord>(storage, shareKey(code)))) {
     throw new AppError("分享码已存在，请换一个");
   }
 
-  while (!input.code && (await readJson<ShareRecord>(bucket, shareKey(code)))) {
+  while (!input.code && (await readJson<ShareRecord>(storage, shareKey(code)))) {
     code = randomShareCode();
   }
 
@@ -310,17 +304,17 @@ export async function createShare(bucket: R2Bucket, input: CreateShareInput) {
     expiresAt: input.expiresAt ?? null,
   };
 
-  await writeJson(bucket, shareKey(code), share);
+  await writeJson(storage, shareKey(code), share);
   return share;
 }
 
-export async function getShare(bucket: R2Bucket, code: string) {
+export async function getShare(storage: ObjectStorage, code: string) {
   const normalized = normalizeShareCode(code);
-  const share = await readJson<ShareRecord>(bucket, shareKey(normalized));
+  const share = await readJson<ShareRecord>(storage, shareKey(normalized));
   if (!share) return null;
 
   if (isExpired(share.expiresAt)) {
-    await bucket.delete(shareKey(normalized));
+    await storage.delete(shareKey(normalized));
     return null;
   }
 
@@ -333,8 +327,8 @@ export async function verifySharePassword(share: ShareRecord, password: string |
   return (await hashPassword(share.code, password)) === share.passwordHash;
 }
 
-export async function resolveShareFiles(bucket: R2Bucket, share: ShareRecord) {
+export async function resolveShareFiles(storage: ObjectStorage, share: ShareRecord) {
   return (
-    await Promise.all(share.fileIds.map((id) => getActiveFileMeta(bucket, id)))
+    await Promise.all(share.fileIds.map((id) => getActiveFileMeta(storage, id)))
   ).filter(Boolean) as DriveFileMeta[];
 }

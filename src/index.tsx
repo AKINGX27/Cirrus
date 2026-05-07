@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { jsxRenderer } from "hono/jsx-renderer";
+import { createObjectStorage, storageLabel, type ObjectStorage, type StorageEnv } from "./object-storage";
 import {
   AppError,
   copyFiles,
@@ -11,6 +12,7 @@ import {
   incrementDownload,
   listFiles,
   objectKey,
+  cleanDescription,
   parseOptionalDate,
   renameFile,
   resolveShareFiles,
@@ -20,9 +22,7 @@ import {
 } from "./storage";
 import { createStoredZipStream } from "./zip";
 
-type Bindings = {
-  DRIVE_BUCKET: R2Bucket;
-};
+type Bindings = StorageEnv;
 
 const app = new Hono<{ Bindings: Bindings }>();
 
@@ -75,12 +75,12 @@ function idsFromValue(value: unknown) {
   return Array.from(new Set(ids));
 }
 
-async function zipResponse(bucket: R2Bucket, files: DriveFileMeta[], archiveName: string) {
+async function zipResponse(storage: ObjectStorage, files: DriveFileMeta[], archiveName: string) {
   if (!files.length) throw new AppError("文件不存在", 404);
 
   const sources = [];
   for (const file of files) {
-    const object = await bucket.get(objectKey(file.id));
+    const object = await storage.get(objectKey(file.id));
     if (!object?.body) continue;
     sources.push({
       name: file.name,
@@ -92,7 +92,7 @@ async function zipResponse(bucket: R2Bucket, files: DriveFileMeta[], archiveName
 
   if (!sources.length) throw new AppError("文件不存在", 404);
 
-  await Promise.all(files.map((file) => incrementDownload(bucket, file.id)));
+  await Promise.all(files.map((file) => incrementDownload(storage, file.id)));
 
   return new Response(createStoredZipStream(sources), {
     headers: {
@@ -103,11 +103,11 @@ async function zipResponse(bucket: R2Bucket, files: DriveFileMeta[], archiveName
   });
 }
 
-async function singleFileResponse(bucket: R2Bucket, file: DriveFileMeta) {
-  const object = await bucket.get(objectKey(file.id));
+async function singleFileResponse(storage: ObjectStorage, file: DriveFileMeta) {
+  const object = await storage.get(objectKey(file.id));
   if (!object?.body) throw new AppError("文件不存在", 404);
 
-  await incrementDownload(bucket, file.id);
+  await incrementDownload(storage, file.id);
 
   return new Response(object.body, {
     headers: {
@@ -135,7 +135,7 @@ app.use(
   }),
 );
 
-app.get("/", (c) => c.render(<DriveApp />));
+app.get("/", (c) => c.render(<DriveApp storageName={storageLabel(c.env)} />));
 
 app.get("/s/:code", (c) => {
   const code = c.req.param("code");
@@ -143,7 +143,8 @@ app.get("/s/:code", (c) => {
 });
 
 app.get("/api/files", async (c) => {
-  const files = await listFiles(c.env.DRIVE_BUCKET);
+  const storage = createObjectStorage(c.env);
+  const files = await listFiles(storage);
   return c.json({ files });
 });
 
@@ -151,15 +152,15 @@ app.post("/api/files", async (c) => {
   try {
     const form = await c.req.formData();
     const expiresAt = parseOptionalDate(form.get("expiresAt"));
+    const description = cleanDescription(form.get("description"));
     const files = (form.getAll("files") as unknown[]).filter(isUploadedFile);
 
     if (!files.length) {
       throw new AppError("请选择要上传的文件");
     }
 
-    const uploaded = await Promise.all(
-      files.map((file) => createFileFromUpload(c.env.DRIVE_BUCKET, file, expiresAt)),
-    );
+    const storage = createObjectStorage(c.env);
+    const uploaded = await Promise.all(files.map((file) => createFileFromUpload(storage, file, expiresAt, description)));
 
     return c.json({ files: uploaded }, 201);
   } catch (error) {
@@ -174,7 +175,8 @@ app.patch("/api/files/:id", async (c) => {
     if (typeof body.name !== "string" || !body.name.trim()) {
       throw new AppError("请输入文件名");
     }
-    const file = await renameFile(c.env.DRIVE_BUCKET, c.req.param("id"), body.name);
+    const storage = createObjectStorage(c.env);
+    const file = await renameFile(storage, c.req.param("id"), body.name);
     return c.json({ file });
   } catch (error) {
     const { message, status } = jsonError(error);
@@ -186,7 +188,8 @@ app.delete("/api/files", async (c) => {
   try {
     const body = await jsonBody<{ ids?: unknown }>(c.req.raw);
     const ids = idsFromValue(body.ids);
-    await Promise.all(ids.map((id) => deleteDriveFile(c.env.DRIVE_BUCKET, id)));
+    const storage = createObjectStorage(c.env);
+    await Promise.all(ids.map((id) => deleteDriveFile(storage, id)));
     return c.json({ ok: true });
   } catch (error) {
     const { message, status } = jsonError(error);
@@ -198,7 +201,8 @@ app.post("/api/files/copy", async (c) => {
   try {
     const body = await jsonBody<{ ids?: unknown }>(c.req.raw);
     const ids = idsFromValue(body.ids);
-    const files = await copyFiles(c.env.DRIVE_BUCKET, ids);
+    const storage = createObjectStorage(c.env);
+    const files = await copyFiles(storage, ids);
     return c.json({ files });
   } catch (error) {
     const { message, status } = jsonError(error);
@@ -208,9 +212,10 @@ app.post("/api/files/copy", async (c) => {
 
 app.get("/api/files/:id/download", async (c) => {
   try {
-    const file = await getActiveFileMeta(c.env.DRIVE_BUCKET, c.req.param("id"));
+    const storage = createObjectStorage(c.env);
+    const file = await getActiveFileMeta(storage, c.req.param("id"));
     if (!file) throw new AppError("文件不存在", 404);
-    return singleFileResponse(c.env.DRIVE_BUCKET, file);
+    return singleFileResponse(storage, file);
   } catch (error) {
     const { message, status } = jsonError(error);
     return errorResponse(message, status);
@@ -221,15 +226,16 @@ app.post("/api/files/download", async (c) => {
   try {
     const body = await jsonBody<{ ids?: unknown }>(c.req.raw);
     const ids = idsFromValue(body.ids);
+    const storage = createObjectStorage(c.env);
     const files = (
-      await Promise.all(ids.map((id) => getActiveFileMeta(c.env.DRIVE_BUCKET, id)))
+      await Promise.all(ids.map((id) => getActiveFileMeta(storage, id)))
     ).filter(Boolean) as DriveFileMeta[];
 
     if (files.length === 1) {
-      return singleFileResponse(c.env.DRIVE_BUCKET, files[0]);
+      return singleFileResponse(storage, files[0]);
     }
 
-    return zipResponse(c.env.DRIVE_BUCKET, files, `Cirrus-${new Date().toISOString().slice(0, 10)}.zip`);
+    return zipResponse(storage, files, `Cirrus-${new Date().toISOString().slice(0, 10)}.zip`);
   } catch (error) {
     const { message, status } = jsonError(error);
     return errorResponse(message, status);
@@ -252,7 +258,8 @@ app.post("/api/shares", async (c) => {
       expiresAt: parseOptionalDate(body.expiresAt),
     };
 
-    const share = await createShare(c.env.DRIVE_BUCKET, input);
+    const storage = createObjectStorage(c.env);
+    const share = await createShare(storage, input);
     return c.json({
       share: {
         code: share.code,
@@ -270,7 +277,8 @@ app.post("/api/shares", async (c) => {
 
 app.get("/api/shares/:code", async (c) => {
   try {
-    const share = await getShare(c.env.DRIVE_BUCKET, c.req.param("code"));
+    const storage = createObjectStorage(c.env);
+    const share = await getShare(storage, c.req.param("code"));
     if (!share) throw new AppError("分享不存在或已过期", 404);
 
     const password = c.req.query("password");
@@ -283,7 +291,7 @@ app.get("/api/shares/:code", async (c) => {
       });
     }
 
-    const files = await resolveShareFiles(c.env.DRIVE_BUCKET, share);
+    const files = await resolveShareFiles(storage, share);
     return c.json({
       locked: false,
       code: share.code,
@@ -299,29 +307,30 @@ app.get("/api/shares/:code", async (c) => {
 app.post("/api/shares/:code/download", async (c) => {
   try {
     const body = await jsonBody<{ password?: unknown; ids?: unknown }>(c.req.raw);
-    const share = await getShare(c.env.DRIVE_BUCKET, c.req.param("code"));
+    const storage = createObjectStorage(c.env);
+    const share = await getShare(storage, c.req.param("code"));
     if (!share) throw new AppError("分享不存在或已过期", 404);
 
     const password = typeof body.password === "string" ? body.password : undefined;
     const verified = await verifySharePassword(share, password);
     if (!verified) throw new AppError("密码不正确", 403);
 
-    const allFiles = await resolveShareFiles(c.env.DRIVE_BUCKET, share);
+    const allFiles = await resolveShareFiles(storage, share);
     const requestedIds = body.ids ? new Set(idsFromValue(body.ids)) : null;
     const files = requestedIds ? allFiles.filter((file) => requestedIds.has(file.id)) : allFiles;
 
     if (files.length === 1) {
-      return singleFileResponse(c.env.DRIVE_BUCKET, files[0]);
+      return singleFileResponse(storage, files[0]);
     }
 
-    return zipResponse(c.env.DRIVE_BUCKET, files, `Cirrus-share-${share.code}.zip`);
+    return zipResponse(storage, files, `Cirrus-share-${share.code}.zip`);
   } catch (error) {
     const { message, status } = jsonError(error);
     return errorResponse(message, status);
   }
 });
 
-function DriveApp() {
+function DriveApp({ storageName }: { storageName: string }) {
   return (
     <main class="app-shell" data-app="drive">
       <aside class="side-rail">
@@ -329,7 +338,7 @@ function DriveApp() {
           <span class="brand-mark">C</span>
           <span>
             <strong>Cirrus</strong>
-            <small>R2 Drive</small>
+            <small>Cloud Drive</small>
           </span>
         </a>
         <nav class="nav-stack" aria-label="主导航">
@@ -344,7 +353,7 @@ function DriveApp() {
           </button>
         </nav>
         <div class="storage-card">
-          <span>Cloudflare R2</span>
+          <span>{storageName}</span>
           <strong id="storage-count">0 个文件</strong>
         </div>
       </aside>
@@ -367,6 +376,7 @@ function DriveApp() {
               <option value="30">保留 30 天</option>
               <option value="custom">自定义</option>
             </select>
+            <input id="upload-description" name="description" maxLength={500} placeholder="描述" aria-label="文件描述" />
             <input id="custom-expiry" type="datetime-local" aria-label="自定义存留到期时间" hidden />
           </form>
         </header>
@@ -384,6 +394,7 @@ function DriveApp() {
         <section class="file-surface" id="file-surface" aria-label="文件列表">
           <div class="table-head" aria-hidden="true">
             <span>名称</span>
+            <span>描述</span>
             <span>上传时间</span>
             <span>最后下载</span>
             <span>下载次数</span>
@@ -698,7 +709,7 @@ h2 {
   display: flex;
   align-items: center;
   gap: 8px;
-  min-width: min(100%, 520px);
+  min-width: min(100%, 720px);
   justify-content: flex-end;
 }
 
@@ -761,7 +772,7 @@ h2 {
 .table-head,
 .file-row {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) minmax(150px, 0.48fr) minmax(150px, 0.48fr) 112px;
+  grid-template-columns: minmax(220px, 1fr) minmax(180px, 0.78fr) minmax(150px, 0.45fr) minmax(150px, 0.45fr) 112px;
   align-items: center;
   gap: 12px;
 }
@@ -836,6 +847,13 @@ h2 {
   display: block;
   color: var(--muted);
   font-size: 0.82rem;
+}
+
+.file-description {
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .empty-state {
@@ -1012,10 +1030,11 @@ h2 {
     grid-template-columns: 1fr auto;
     grid-template-areas:
       "name count"
+      "description description"
       "uploaded uploaded"
       "downloaded downloaded";
     gap: 4px 12px;
-    min-height: 86px;
+    min-height: 104px;
     padding: 12px;
   }
 
@@ -1024,14 +1043,18 @@ h2 {
   }
 
   .file-row > :nth-child(2) {
-    grid-area: uploaded;
+    grid-area: description;
   }
 
   .file-row > :nth-child(3) {
-    grid-area: downloaded;
+    grid-area: uploaded;
   }
 
   .file-row > :nth-child(4) {
+    grid-area: downloaded;
+  }
+
+  .file-row > :nth-child(5) {
     grid-area: count;
     text-align: right;
   }
@@ -1182,10 +1205,12 @@ const clientScript = String.raw`
             '<small class="file-size">' + formatSize(file.size) + '</small>' +
           '</span>' +
         '</span>' +
+        '<span class="file-description"></span>' +
         '<span>' + formatDate(file.uploadedAt) + '</span>' +
         '<span>' + formatDate(file.lastDownloadedAt) + '</span>' +
         '<span>' + file.downloadCount + '</span>';
       row.querySelector(".file-title").textContent = file.name;
+      row.querySelector(".file-description").textContent = file.description || "无描述";
 
       row.addEventListener("click", (event) => {
         if (event.shiftKey || event.metaKey || event.ctrlKey) {
@@ -1258,6 +1283,7 @@ const clientScript = String.raw`
 
     const form = new FormData();
     for (const file of files) form.append("files", file);
+    form.append("description", document.getElementById("upload-description").value);
     form.append("expiresAt", getExpiryValue());
 
     notify("正在上传 " + files.length + " 个文件...");
@@ -1266,6 +1292,7 @@ const clientScript = String.raw`
       body: form
     });
     input.value = "";
+    document.getElementById("upload-description").value = "";
     await loadFiles();
     notify("上传完成");
   }
@@ -1537,10 +1564,12 @@ const shareClientScript = String.raw`
             '<small class="file-size">' + formatSize(file.size) + '</small>' +
           '</span>' +
         '</span>' +
+        '<span class="file-description"></span>' +
         '<span>' + formatDate(file.uploadedAt) + '</span>' +
         '<span>' + formatDate(file.lastDownloadedAt) + '</span>' +
         '<span>' + file.downloadCount + '</span>';
       row.querySelector(".file-title").textContent = file.name;
+      row.querySelector(".file-description").textContent = file.description || "无描述";
       row.addEventListener("click", () => download([file.id]));
       list.append(row);
     }
