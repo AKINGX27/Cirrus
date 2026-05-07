@@ -1954,7 +1954,6 @@ function DriveApp({ storageName, session, nonce }: { storageName: string; sessio
         <form method="dialog" class="modal-panel" id="share-form">
           <header>
             <h2>创建分享</h2>
-            <button type="button" data-action="close-share-dialog" aria-label="关闭">×</button>
           </header>
           <label>
             <span>分享码</span>
