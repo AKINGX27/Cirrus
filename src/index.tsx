@@ -1891,20 +1891,6 @@ function DriveApp({ storageName, session, nonce }: { storageName: string; sessio
             <span>选择文件</span>
             <input id="file-input" name="files" type="file" multiple />
           </label>
-          <label>
-            <span>批量描述</span>
-            <textarea id="bulk-description" maxLength={500} rows={3} placeholder="输入后可应用到全部文件"></textarea>
-          </label>
-          <div class="bulk-tools">
-            <label>
-              <span>批量标签</span>
-              <input id="bulk-tags" placeholder="多个标签用逗号分隔" autocomplete="off" />
-            </label>
-            <div>
-              <button type="button" id="apply-bulk-description" disabled>应用描述</button>
-              <button type="button" id="apply-bulk-tags" disabled>应用标签</button>
-            </div>
-          </div>
           <div id="upload-file-list" class="upload-file-list"></div>
           <label>
             <span>存留时间</span>
@@ -2584,7 +2570,7 @@ button.tag-chip {
 }
 
 .selection-box {
-  position: fixed;
+  position: absolute;
   z-index: 10;
   border: 1px solid var(--accent);
   background: color-mix(in srgb, var(--accent), transparent 80%);
@@ -2724,18 +2710,6 @@ button.tag-chip {
 
 .upload-file-row textarea {
   min-height: 74px;
-}
-
-.bulk-tools {
-  display: grid;
-  grid-template-columns: minmax(180px, 1fr) auto;
-  align-items: end;
-  gap: 10px;
-}
-
-.bulk-tools > div {
-  display: flex;
-  gap: 8px;
 }
 
 .permission-modal {
@@ -3177,10 +3151,6 @@ button.tag-chip {
     grid-template-columns: 1fr;
   }
 
-  .bulk-tools {
-    grid-template-columns: 1fr;
-  }
-
   .friends-layout {
     grid-template-columns: 1fr;
     min-height: 0;
@@ -3223,10 +3193,6 @@ const clientScript = String.raw`
   const uploadDialog = document.getElementById("upload-dialog");
   const uploadForm = document.getElementById("upload-form");
   const fileInput = document.getElementById("file-input");
-  const bulkDescription = document.getElementById("bulk-description");
-  const bulkTags = document.getElementById("bulk-tags");
-  const applyBulkDescription = document.getElementById("apply-bulk-description");
-  const applyBulkTags = document.getElementById("apply-bulk-tags");
   const uploadFileList = document.getElementById("upload-file-list");
   const confirmUploadButton = document.getElementById("confirm-upload-button");
   const notificationButton = document.querySelector('[data-action="notifications"]');
@@ -3555,8 +3521,6 @@ const clientScript = String.raw`
       uploadFileList.append(row);
     }
     confirmUploadButton.disabled = pendingUploads.length === 0;
-    applyBulkDescription.disabled = pendingUploads.length === 0;
-    applyBulkTags.disabled = pendingUploads.length === 0;
   }
 
   function renderNotifications() {
@@ -3860,8 +3824,6 @@ const clientScript = String.raw`
   function resetUploadDialog() {
     pendingUploads = [];
     fileInput.value = "";
-    bulkDescription.value = "";
-    bulkTags.value = "";
     document.getElementById("retention-select").value = "";
     document.getElementById("custom-expiry").value = "";
     document.getElementById("custom-expiry").hidden = true;
@@ -3876,24 +3838,9 @@ const clientScript = String.raw`
   function updatePendingFiles() {
     pendingUploads = Array.from(fileInput.files || []).map((file) => ({
       file,
-      description: bulkDescription.value,
-      tags: parseTags(bulkTags.value)
+      description: "",
+      tags: []
     }));
-    renderPendingUploads();
-  }
-
-  function applyBulkDescriptionToFiles() {
-    for (const item of pendingUploads) {
-      item.description = bulkDescription.value;
-    }
-    renderPendingUploads();
-  }
-
-  function applyBulkTagsToFiles() {
-    const tags = parseTags(bulkTags.value);
-    for (const item of pendingUploads) {
-      item.tags = tags.slice();
-    }
     renderPendingUploads();
   }
 
@@ -3908,8 +3855,6 @@ const clientScript = String.raw`
       form.append("description:" + index, item.description);
       form.append("tags:" + index, tagsToText(item.tags));
     });
-    form.append("description", bulkDescription.value);
-    form.append("tags", bulkTags.value);
     form.append("expiresAt", getExpiryValue());
 
     notify("正在上传 " + uploads.length + " 个文件...");
@@ -4163,9 +4108,10 @@ const clientScript = String.raw`
     const top = Math.min(start.y, current.y);
     const width = Math.abs(start.x - current.x);
     const height = Math.abs(start.y - current.y);
+    const surfaceRect = surface.getBoundingClientRect();
     Object.assign(selectionBox.style, {
-      left: left + "px",
-      top: top + "px",
+      left: (left - surfaceRect.left) + "px",
+      top: (top - surfaceRect.top) + "px",
       width: width + "px",
       height: height + "px"
     });
@@ -4256,8 +4202,6 @@ const clientScript = String.raw`
     friendsStatus.textContent = error.message;
   }));
   fileInput.addEventListener("change", updatePendingFiles);
-  applyBulkDescription.addEventListener("click", applyBulkDescriptionToFiles);
-  applyBulkTags.addEventListener("click", applyBulkTagsToFiles);
   uploadForm.addEventListener("submit", (event) => uploadSelected(event).catch((error) => notify(error.message, "error")));
   document.querySelector('[data-action="refresh"]').addEventListener("click", () => loadFiles().catch((error) => notify(error.message, "error")));
   document.querySelector('[data-action="manage-permissions"]')?.addEventListener("click", () => openPermissionDialog().catch((error) => notify(error.message, "error")));
