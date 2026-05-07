@@ -3,8 +3,17 @@ import { XMLParser } from "fast-xml-parser";
 
 export type StorageBackend = "r2" | "s3";
 
+const META_PREFIX = "meta/";
+const SHARE_PREFIX = "shares/";
+const DIRECT_MESSAGES_PREFIX = "messages/";
+const PERMISSIONS_KEY = "permissions/tag-grants.json";
+const USER_PROFILES_KEY = "permissions/user-profiles.json";
+const USER_PASSWORDS_KEY = "accounts/passwords.json";
+const LEGACY_MIGRATION_NAME = "legacy-object-json-v1";
+
 export interface StorageEnv {
   DRIVE_BUCKET?: R2Bucket;
+  DB?: D1Database;
   STORAGE_BACKEND?: string;
   S3_BUCKET?: string;
   S3_REGION?: string;
@@ -116,6 +125,20 @@ class ResponseStoredObject implements StoredObject {
 
   text() {
     return this.response.text();
+  }
+}
+
+class TextStoredObject implements StoredObject {
+  constructor(private value: string) {}
+
+  get body() {
+    const body = new Response(this.value).body;
+    if (!body) throw new Error("Stored text object did not include a body");
+    return body;
+  }
+
+  text() {
+    return Promise.resolve(this.value);
   }
 }
 
@@ -238,6 +261,451 @@ class S3ObjectStorage implements ObjectStorage {
   }
 }
 
+type StructuredKey =
+  | { type: "fileMeta"; id: string }
+  | { type: "share"; code: string }
+  | { type: "tagGrants" }
+  | { type: "userProfiles" }
+  | { type: "userPasswords" }
+  | { type: "directMessages"; conversationId: string };
+
+interface FileMetaRow {
+  id: string;
+  name: string;
+  description: string;
+  tags: string | null;
+  owner: string;
+  size: number;
+  content_type: string;
+  uploaded_at: string;
+  expires_at: string | null;
+  last_downloaded_at: string | null;
+  download_count: number;
+}
+
+interface ShareRow {
+  code: string;
+  file_ids: string | null;
+  password_hash: string | null;
+  created_at: string;
+  expires_at: string | null;
+}
+
+interface UserTagGrantRow {
+  user: string;
+  tags: string | null;
+}
+
+interface UserProfileRow {
+  user: string;
+  nickname: string;
+  avatar: string;
+  status: string;
+  role: string | null;
+  tags: string | null;
+  visible_file_ids: string | null;
+  friends: string | null;
+  notifications: string | null;
+  updated_at: string;
+}
+
+interface UserPasswordRow {
+  user: string;
+  password_hash: string;
+  updated_at: string;
+}
+
+interface DirectMessageRow {
+  id: string;
+  conversation_id: string;
+  from_user: string;
+  to_user: string;
+  message: string;
+  file_ids: string | null;
+  created_at: string;
+}
+
+const D1_SCHEMA = [
+  `CREATE TABLE IF NOT EXISTS file_meta (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    tags TEXT NOT NULL DEFAULT '[]',
+    owner TEXT NOT NULL DEFAULT '',
+    size INTEGER NOT NULL DEFAULT 0,
+    content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+    uploaded_at TEXT NOT NULL,
+    expires_at TEXT,
+    last_downloaded_at TEXT,
+    download_count INTEGER NOT NULL DEFAULT 0
+  )`,
+  "CREATE INDEX IF NOT EXISTS idx_file_meta_uploaded_at ON file_meta(uploaded_at DESC)",
+  "CREATE INDEX IF NOT EXISTS idx_file_meta_owner ON file_meta(owner)",
+  "CREATE INDEX IF NOT EXISTS idx_file_meta_expires_at ON file_meta(expires_at)",
+  `CREATE TABLE IF NOT EXISTS shares (
+    code TEXT PRIMARY KEY,
+    file_ids TEXT NOT NULL DEFAULT '[]',
+    password_hash TEXT,
+    created_at TEXT NOT NULL,
+    expires_at TEXT
+  )`,
+  "CREATE INDEX IF NOT EXISTS idx_shares_expires_at ON shares(expires_at)",
+  `CREATE TABLE IF NOT EXISTS user_tag_grants (
+    user TEXT PRIMARY KEY,
+    tags TEXT NOT NULL DEFAULT '[]',
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS user_profiles (
+    user TEXT PRIMARY KEY,
+    nickname TEXT NOT NULL DEFAULT '',
+    avatar TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT '',
+    role TEXT,
+    tags TEXT NOT NULL DEFAULT '[]',
+    visible_file_ids TEXT NOT NULL DEFAULT '[]',
+    friends TEXT NOT NULL DEFAULT '[]',
+    notifications TEXT NOT NULL DEFAULT '[]',
+    updated_at TEXT NOT NULL
+  )`,
+  "CREATE INDEX IF NOT EXISTS idx_user_profiles_nickname ON user_profiles(nickname)",
+  `CREATE TABLE IF NOT EXISTS user_passwords (
+    user TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS direct_messages (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    from_user TEXT NOT NULL,
+    to_user TEXT NOT NULL,
+    message TEXT NOT NULL DEFAULT '',
+    file_ids TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+  )`,
+  "CREATE INDEX IF NOT EXISTS idx_direct_messages_conversation ON direct_messages(conversation_id, created_at)",
+  `CREATE TABLE IF NOT EXISTS structured_migrations (
+    name TEXT PRIMARY KEY,
+    completed_at TEXT NOT NULL
+  )`,
+];
+
+class D1StructuredStorage implements ObjectStorage {
+  private schemaReady?: Promise<void>;
+  private legacyReady?: Promise<void>;
+
+  constructor(
+    private db: D1Database,
+    private objects: ObjectStorage,
+  ) {}
+
+  async get(key: string) {
+    const structured = structuredKey(key);
+    if (!structured) return this.objects.get(key);
+
+    await this.ensureReady();
+    const value = await this.readStructured(structured);
+    if (value !== null) return jsonObject(value);
+
+    const legacy = await this.objects.get(key);
+    if (!legacy) return null;
+
+    const parsed = parseJson(await legacy.text());
+    if (parsed !== null) await this.writeStructured(structured, parsed);
+    return jsonObject(parsed);
+  }
+
+  async put(key: string, value: ObjectStorageValue, options?: PutObjectOptions) {
+    const structured = structuredKey(key);
+    if (!structured) {
+      await this.objects.put(key, value, options);
+      return;
+    }
+
+    await this.ensureReady();
+    await this.writeStructured(structured, parseJson(await valueToText(value)));
+  }
+
+  async delete(key: string) {
+    const structured = structuredKey(key);
+    if (!structured) {
+      await this.objects.delete(key);
+      return;
+    }
+
+    await this.ensureReady();
+    await this.deleteStructured(structured);
+  }
+
+  async list(options: ObjectStorageListOptions) {
+    if (options.prefix !== META_PREFIX) return this.objects.list(options);
+
+    await this.ensureReady();
+    const limit = Math.min(options.limit ?? 1000, 1000);
+    const offset = parseCursor(options.cursor);
+    const result = await this.db
+      .prepare("SELECT id FROM file_meta ORDER BY uploaded_at DESC LIMIT ? OFFSET ?")
+      .bind(limit, offset)
+      .all<{ id: string }>();
+
+    return {
+      objects: (result.results || []).map((row) => ({ key: metaKey(row.id) })),
+      cursor: (result.results || []).length === limit ? String(offset + limit) : undefined,
+      truncated: (result.results || []).length === limit,
+    };
+  }
+
+  private async ensureReady() {
+    await this.ensureSchema();
+    await this.migrateLegacyObjectJson();
+  }
+
+  private async ensureSchema() {
+    this.schemaReady ??= this.db.batch(D1_SCHEMA.map((statement) => this.db.prepare(statement))).then(() => undefined);
+    await this.schemaReady;
+  }
+
+  private async migrateLegacyObjectJson() {
+    this.legacyReady ??= this.migrateLegacyObjectJsonOnce();
+    await this.legacyReady;
+  }
+
+  private async migrateLegacyObjectJsonOnce() {
+    const marker = await this.db
+      .prepare("SELECT name FROM structured_migrations WHERE name = ?")
+      .bind(LEGACY_MIGRATION_NAME)
+      .first<{ name: string }>();
+    if (marker) return;
+
+    await this.importLegacyJson(PERMISSIONS_KEY);
+    await this.importLegacyJson(USER_PROFILES_KEY);
+    await this.importLegacyJson(USER_PASSWORDS_KEY);
+    await this.importLegacyPrefix(META_PREFIX);
+    await this.importLegacyPrefix(SHARE_PREFIX);
+    await this.importLegacyPrefix(DIRECT_MESSAGES_PREFIX);
+
+    await this.db
+      .prepare("INSERT OR REPLACE INTO structured_migrations (name, completed_at) VALUES (?, ?)")
+      .bind(LEGACY_MIGRATION_NAME, new Date().toISOString())
+      .run();
+  }
+
+  private async importLegacyPrefix(prefix: string) {
+    let cursor: string | undefined;
+    do {
+      const listed = await this.objects.list({ prefix, cursor, limit: 1000 });
+      for (const object of listed.objects) {
+        await this.importLegacyJson(object.key);
+      }
+      cursor = listed.truncated ? listed.cursor : undefined;
+    } while (cursor);
+  }
+
+  private async importLegacyJson(key: string) {
+    const structured = structuredKey(key);
+    if (!structured) return;
+
+    const object = await this.objects.get(key);
+    if (!object) return;
+
+    const parsed = parseJson(await object.text());
+    if (parsed !== null) await this.writeStructured(structured, parsed);
+  }
+
+  private async readStructured(key: StructuredKey) {
+    if (key.type === "fileMeta") {
+      const row = await this.db.prepare("SELECT * FROM file_meta WHERE id = ?").bind(key.id).first<FileMetaRow>();
+      return row ? fileMetaFromRow(row) : null;
+    }
+
+    if (key.type === "share") {
+      const row = await this.db.prepare("SELECT * FROM shares WHERE code = ?").bind(key.code).first<ShareRow>();
+      return row ? shareFromRow(row) : null;
+    }
+
+    if (key.type === "tagGrants") {
+      const result = await this.db.prepare("SELECT user, tags FROM user_tag_grants ORDER BY user").all<UserTagGrantRow>();
+      const grants: Record<string, unknown> = {};
+      for (const row of result.results || []) {
+        grants[row.user] = parseJsonField(row.tags, []);
+      }
+      return grants;
+    }
+
+    if (key.type === "userProfiles") {
+      const result = await this.db.prepare("SELECT * FROM user_profiles ORDER BY user").all<UserProfileRow>();
+      const profiles: Record<string, unknown> = {};
+      for (const row of result.results || []) {
+        profiles[row.user] = userProfileFromRow(row);
+      }
+      return profiles;
+    }
+
+    if (key.type === "userPasswords") {
+      const result = await this.db.prepare("SELECT * FROM user_passwords ORDER BY user").all<UserPasswordRow>();
+      const credentials: Record<string, unknown> = {};
+      for (const row of result.results || []) {
+        credentials[row.user] = {
+          passwordHash: row.password_hash,
+          updatedAt: row.updated_at,
+        };
+      }
+      return credentials;
+    }
+
+    const result = await this.db
+      .prepare("SELECT * FROM direct_messages WHERE conversation_id = ? ORDER BY created_at ASC LIMIT 500")
+      .bind(key.conversationId)
+      .all<DirectMessageRow>();
+    return (result.results || []).map(directMessageFromRow);
+  }
+
+  private async writeStructured(key: StructuredKey, value: unknown) {
+    if (key.type === "fileMeta") {
+      const meta = asRecord(value);
+      const id = typeof meta.id === "string" ? meta.id : key.id;
+      await this.db
+        .prepare(
+          `INSERT OR REPLACE INTO file_meta
+            (id, name, description, tags, owner, size, content_type, uploaded_at, expires_at, last_downloaded_at, download_count)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .bind(
+          id,
+          stringValue(meta.name),
+          stringValue(meta.description),
+          jsonField(meta.tags),
+          stringValue(meta.owner),
+          numberValue(meta.size),
+          stringValue(meta.contentType, "application/octet-stream"),
+          stringValue(meta.uploadedAt, new Date(0).toISOString()),
+          nullableString(meta.expiresAt),
+          nullableString(meta.lastDownloadedAt),
+          numberValue(meta.downloadCount),
+        )
+        .run();
+      return;
+    }
+
+    if (key.type === "share") {
+      const share = asRecord(value);
+      await this.db
+        .prepare(
+          `INSERT OR REPLACE INTO shares (code, file_ids, password_hash, created_at, expires_at)
+           VALUES (?, ?, ?, ?, ?)`,
+        )
+        .bind(
+          stringValue(share.code, key.code),
+          jsonField(share.fileIds),
+          nullableString(share.passwordHash),
+          stringValue(share.createdAt, new Date().toISOString()),
+          nullableString(share.expiresAt),
+        )
+        .run();
+      return;
+    }
+
+    if (key.type === "tagGrants") {
+      const grants = asRecord(value);
+      const statements = [this.db.prepare("DELETE FROM user_tag_grants")];
+      const now = new Date().toISOString();
+      for (const [user, tags] of Object.entries(grants)) {
+        statements.push(
+          this.db
+            .prepare("INSERT OR REPLACE INTO user_tag_grants (user, tags, updated_at) VALUES (?, ?, ?)")
+            .bind(user, jsonField(tags), now),
+        );
+      }
+      await this.db.batch(statements);
+      return;
+    }
+
+    if (key.type === "userProfiles") {
+      const profiles = asRecord(value);
+      const statements = [this.db.prepare("DELETE FROM user_profiles")];
+      for (const [user, profileValue] of Object.entries(profiles)) {
+        const profile = asRecord(profileValue);
+        statements.push(
+          this.db
+            .prepare(
+              `INSERT OR REPLACE INTO user_profiles
+                (user, nickname, avatar, status, role, tags, visible_file_ids, friends, notifications, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .bind(
+              user,
+              stringValue(profile.nickname),
+              stringValue(profile.avatar),
+              stringValue(profile.status),
+              nullableString(profile.role),
+              jsonField(profile.tags),
+              jsonField(profile.visibleFileIds),
+              jsonField(profile.friends),
+              jsonField(profile.notifications),
+              stringValue(profile.updatedAt, new Date().toISOString()),
+            ),
+        );
+      }
+      await this.db.batch(statements);
+      return;
+    }
+
+    if (key.type === "userPasswords") {
+      const credentials = asRecord(value);
+      const statements = [this.db.prepare("DELETE FROM user_passwords")];
+      for (const [user, credentialValue] of Object.entries(credentials)) {
+        const credential = asRecord(credentialValue);
+        statements.push(
+          this.db
+            .prepare("INSERT OR REPLACE INTO user_passwords (user, password_hash, updated_at) VALUES (?, ?, ?)")
+            .bind(user, stringValue(credential.passwordHash), stringValue(credential.updatedAt, new Date().toISOString())),
+        );
+      }
+      await this.db.batch(statements);
+      return;
+    }
+
+    const messages = Array.isArray(value) ? value.slice(-500) : [];
+    const statements = [this.db.prepare("DELETE FROM direct_messages WHERE conversation_id = ?").bind(key.conversationId)];
+    for (const messageValue of messages) {
+      const message = asRecord(messageValue);
+      statements.push(
+        this.db
+          .prepare(
+            `INSERT OR REPLACE INTO direct_messages
+              (id, conversation_id, from_user, to_user, message, file_ids, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .bind(
+            stringValue(message.id, crypto.randomUUID()),
+            key.conversationId,
+            stringValue(message.from),
+            stringValue(message.to),
+            stringValue(message.message),
+            jsonField(message.fileIds),
+            stringValue(message.createdAt, new Date().toISOString()),
+          ),
+      );
+    }
+    await this.db.batch(statements);
+  }
+
+  private async deleteStructured(key: StructuredKey) {
+    if (key.type === "fileMeta") {
+      await this.db.prepare("DELETE FROM file_meta WHERE id = ?").bind(key.id).run();
+    } else if (key.type === "share") {
+      await this.db.prepare("DELETE FROM shares WHERE code = ?").bind(key.code).run();
+    } else if (key.type === "tagGrants") {
+      await this.db.prepare("DELETE FROM user_tag_grants").run();
+    } else if (key.type === "userProfiles") {
+      await this.db.prepare("DELETE FROM user_profiles").run();
+    } else if (key.type === "userPasswords") {
+      await this.db.prepare("DELETE FROM user_passwords").run();
+    } else {
+      await this.db.prepare("DELETE FROM direct_messages WHERE conversation_id = ?").bind(key.conversationId).run();
+    }
+  }
+}
+
 export function storageBackend(env: StorageEnv): StorageBackend {
   const backend = env.STORAGE_BACKEND?.trim().toLowerCase();
   if (!backend) return "r2";
@@ -251,16 +719,17 @@ export function storageLabel(env: StorageEnv) {
 
 export function createObjectStorage(env: StorageEnv): ObjectStorage {
   const backend = storageBackend(env);
+  let storage: ObjectStorage;
 
   if (backend === "s3") {
-    return new S3ObjectStorage(resolveS3Config(env));
-  }
-
-  if (!env.DRIVE_BUCKET) {
+    storage = new S3ObjectStorage(resolveS3Config(env));
+  } else if (!env.DRIVE_BUCKET) {
     throw new Error("DRIVE_BUCKET binding is missing. Use the R2 Wrangler config or set STORAGE_BACKEND=s3.");
+  } else {
+    storage = new R2ObjectStorage(env.DRIVE_BUCKET);
   }
 
-  return new R2ObjectStorage(env.DRIVE_BUCKET);
+  return env.DB ? new D1StructuredStorage(env.DB, storage) : storage;
 }
 
 function resolveS3Config(env: StorageEnv): S3Config {
@@ -314,4 +783,135 @@ function encodeKey(key: string) {
 function joinPath(basePath: string, next: string) {
   const base = basePath.replace(/\/+$/, "");
   return `${base}/${encodeURIComponent(next)}`;
+}
+
+function metaKey(id: string) {
+  return `${META_PREFIX}${id}.json`;
+}
+
+function structuredKey(key: string): StructuredKey | null {
+  if (key.startsWith(META_PREFIX) && key.endsWith(".json")) {
+    const id = key.slice(META_PREFIX.length, -".json".length);
+    return id ? { type: "fileMeta", id } : null;
+  }
+
+  if (key.startsWith(SHARE_PREFIX) && key.endsWith(".json")) {
+    const code = key.slice(SHARE_PREFIX.length, -".json".length);
+    return code ? { type: "share", code } : null;
+  }
+
+  if (key === PERMISSIONS_KEY) return { type: "tagGrants" };
+  if (key === USER_PROFILES_KEY) return { type: "userProfiles" };
+  if (key === USER_PASSWORDS_KEY) return { type: "userPasswords" };
+
+  if (key.startsWith(DIRECT_MESSAGES_PREFIX) && key.endsWith(".json")) {
+    const conversationId = key.slice(DIRECT_MESSAGES_PREFIX.length, -".json".length);
+    return conversationId ? { type: "directMessages", conversationId } : null;
+  }
+
+  return null;
+}
+
+function jsonObject(value: unknown) {
+  return new TextStoredObject(JSON.stringify(value ?? null));
+}
+
+function parseCursor(value: string | undefined) {
+  if (!value) return 0;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+function parseJson(value: string) {
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function parseJsonField(value: string | null | undefined, fallback: unknown) {
+  if (!value) return fallback;
+  const parsed = parseJson(value);
+  return parsed ?? fallback;
+}
+
+function jsonField(value: unknown) {
+  return JSON.stringify(value ?? []);
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function stringValue(value: unknown, fallback = "") {
+  return typeof value === "string" ? value : fallback;
+}
+
+function nullableString(value: unknown) {
+  return typeof value === "string" ? value : null;
+}
+
+function numberValue(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+async function valueToText(value: ObjectStorageValue) {
+  if (typeof value === "string") return value;
+  if (value instanceof Blob) return value.text();
+  if (value instanceof ReadableStream) return new Response(value).text();
+  if (value instanceof ArrayBuffer) return new TextDecoder().decode(value);
+
+  return new TextDecoder().decode(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+}
+
+function fileMetaFromRow(row: FileMetaRow) {
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    tags: parseJsonField(row.tags, []),
+    owner: row.owner,
+    size: Number(row.size) || 0,
+    contentType: row.content_type,
+    uploadedAt: row.uploaded_at,
+    expiresAt: row.expires_at,
+    lastDownloadedAt: row.last_downloaded_at,
+    downloadCount: Number(row.download_count) || 0,
+  };
+}
+
+function shareFromRow(row: ShareRow) {
+  return {
+    code: row.code,
+    fileIds: parseJsonField(row.file_ids, []),
+    passwordHash: row.password_hash,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+  };
+}
+
+function userProfileFromRow(row: UserProfileRow) {
+  return {
+    nickname: row.nickname,
+    avatar: row.avatar,
+    status: row.status,
+    role: row.role,
+    tags: parseJsonField(row.tags, []),
+    visibleFileIds: parseJsonField(row.visible_file_ids, []),
+    friends: parseJsonField(row.friends, []),
+    notifications: parseJsonField(row.notifications, []),
+    updatedAt: row.updated_at,
+  };
+}
+
+function directMessageFromRow(row: DirectMessageRow) {
+  return {
+    id: row.id,
+    from: row.from_user,
+    to: row.to_user,
+    message: row.message,
+    fileIds: parseJsonField(row.file_ids, []),
+    createdAt: row.created_at,
+  };
 }

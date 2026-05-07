@@ -9,5 +9,11 @@
   },
   "vars": {
     "STORAGE_BACKEND": "s3"
-  }
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "migrations_dir": "migrations"
+    }
+  ]
 }

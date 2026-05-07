@@ -14,5 +14,11 @@
     {
       "binding": "DRIVE_BUCKET"
     }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "migrations_dir": "migrations"
+    }
   ]
 }

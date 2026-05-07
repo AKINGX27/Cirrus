@@ -1,5 +1,6 @@
 interface Env {
   DRIVE_BUCKET?: R2Bucket;
+  DB?: D1Database;
   STORAGE_BACKEND?: "r2" | "s3";
   AUTH_USERS?: string;
   ALLOW_UNCONFIGURED_AUTH?: string;

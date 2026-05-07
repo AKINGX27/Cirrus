@@ -8,8 +8,8 @@
     "dev:r2": "wrangler dev --config wrangler.jsonc",
     "dev:s3": "wrangler dev --config wrangler.s3.jsonc",
     "deploy": "node scripts/deploy.mjs",
-    "deploy:r2": "wrangler deploy --config wrangler.jsonc",
-    "deploy:s3": "wrangler deploy --config wrangler.s3.jsonc",
+    "deploy:r2": "wrangler deploy --experimental-provision --config wrangler.jsonc",
+    "deploy:s3": "wrangler deploy --experimental-provision --config wrangler.s3.jsonc",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -20,6 +20,6 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250816.0",
     "typescript": "^5.9.2",
-    "wrangler": "^4.29.1"
+    "wrangler": "4.86.0"
   }
 }
