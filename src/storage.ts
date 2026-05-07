@@ -3,11 +3,14 @@ import type { ObjectStorage } from "./object-storage";
 const OBJECT_PREFIX = "objects/";
 const META_PREFIX = "meta/";
 const SHARE_PREFIX = "shares/";
+const PERMISSIONS_KEY = "permissions/tag-grants.json";
 
 export interface DriveFileMeta {
   id: string;
   name: string;
   description: string;
+  tags: string[];
+  owner: string;
   size: number;
   contentType: string;
   uploadedAt: string;
@@ -30,6 +33,8 @@ export interface CreateShareInput {
   password?: string;
   expiresAt?: string | null;
 }
+
+export type UserTagGrants = Record<string, string[]>;
 
 export class AppError extends Error {
   constructor(
@@ -66,6 +71,35 @@ export function cleanDescription(value: unknown) {
   return value.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 500);
 }
 
+export function cleanTags(value: unknown) {
+  const rawTags = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(/[,，\n]+/)
+      : [];
+  const seen = new Set<string>();
+  const tags: string[] = [];
+
+  for (const raw of rawTags) {
+    if (typeof raw !== "string") continue;
+    const tag = raw.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 32);
+    if (!tag) continue;
+
+    const key = tag.toLocaleLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    tags.push(tag);
+    if (tags.length >= 20) break;
+  }
+
+  return tags;
+}
+
+function cleanOwner(value: unknown) {
+  if (typeof value !== "string") return "";
+  return value.replace(/[\u0000-\u001f\u007f:,\s]+/g, "").trim().slice(0, 64);
+}
+
 export function isExpired(expiresAt: string | null | undefined, now = Date.now()) {
   if (!expiresAt) return false;
   const time = Date.parse(expiresAt);
@@ -98,6 +132,25 @@ async function writeJson(storage: ObjectStorage, key: string, value: unknown) {
   });
 }
 
+function normalizeFileMeta(meta: Partial<DriveFileMeta> | null) {
+  if (!meta || typeof meta.id !== "string" || typeof meta.name !== "string") return null;
+
+  return {
+    id: meta.id,
+    name: cleanFileName(meta.name),
+    description: cleanDescription(meta.description),
+    tags: cleanTags(meta.tags),
+    owner: cleanOwner(meta.owner),
+    size: typeof meta.size === "number" && Number.isFinite(meta.size) ? meta.size : 0,
+    contentType: typeof meta.contentType === "string" && meta.contentType ? meta.contentType : "application/octet-stream",
+    uploadedAt: typeof meta.uploadedAt === "string" ? meta.uploadedAt : new Date(0).toISOString(),
+    expiresAt: typeof meta.expiresAt === "string" ? meta.expiresAt : null,
+    lastDownloadedAt: typeof meta.lastDownloadedAt === "string" ? meta.lastDownloadedAt : null,
+    downloadCount:
+      typeof meta.downloadCount === "number" && Number.isFinite(meta.downloadCount) ? meta.downloadCount : 0,
+  } satisfies DriveFileMeta;
+}
+
 export async function saveFileMeta(storage: ObjectStorage, meta: DriveFileMeta) {
   await writeJson(storage, metaKey(meta.id), meta);
 }
@@ -107,7 +160,7 @@ export async function deleteDriveFile(storage: ObjectStorage, id: string) {
 }
 
 async function readFileMeta(storage: ObjectStorage, id: string) {
-  return readJson<DriveFileMeta>(storage, metaKey(id));
+  return normalizeFileMeta(await readJson<Partial<DriveFileMeta>>(storage, metaKey(id)));
 }
 
 export async function getActiveFileMeta(storage: ObjectStorage, id: string) {
@@ -135,7 +188,7 @@ export async function listFiles(storage: ObjectStorage) {
     });
 
     const batch = await Promise.all(
-      listed.objects.map((object) => readJson<DriveFileMeta>(storage, object.key)),
+      listed.objects.map(async (object) => normalizeFileMeta(await readJson<Partial<DriveFileMeta>>(storage, object.key))),
     );
 
     for (const meta of batch) {
@@ -162,6 +215,8 @@ export async function createFileFromUpload(
   file: File,
   expiresAt: string | null,
   description: string,
+  tags: string[],
+  owner: string,
 ) {
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
@@ -172,6 +227,8 @@ export async function createFileFromUpload(
     id,
     name,
     description: cleanDescription(description),
+    tags: cleanTags(tags),
+    owner: cleanOwner(owner),
     size: file.size,
     contentType,
     uploadedAt: now,
@@ -212,6 +269,18 @@ export async function updateFileDescription(storage: ObjectStorage, id: string, 
   return next;
 }
 
+export async function updateFileTags(storage: ObjectStorage, id: string, tags: string[]) {
+  const meta = await getActiveFileMeta(storage, id);
+  if (!meta) throw new AppError("文件不存在", 404);
+
+  const next: DriveFileMeta = {
+    ...meta,
+    tags: cleanTags(tags),
+  };
+  await saveFileMeta(storage, next);
+  return next;
+}
+
 export async function incrementDownload(storage: ObjectStorage, id: string) {
   const current = await getActiveFileMeta(storage, id);
   if (!current) return null;
@@ -233,7 +302,7 @@ function copyName(name: string) {
   return `${name} - 副本`;
 }
 
-export async function copyFiles(storage: ObjectStorage, ids: string[]) {
+export async function copyFiles(storage: ObjectStorage, ids: string[], owner?: string) {
   const copied: DriveFileMeta[] = [];
 
   for (const id of ids) {
@@ -249,6 +318,7 @@ export async function copyFiles(storage: ObjectStorage, ids: string[]) {
       ...source,
       id: nextId,
       name: copyName(source.name),
+      owner: owner ? cleanOwner(owner) : source.owner,
       uploadedAt,
       lastDownloadedAt: null,
       downloadCount: 0,
@@ -262,6 +332,33 @@ export async function copyFiles(storage: ObjectStorage, ids: string[]) {
   }
 
   return copied;
+}
+
+function normalizeUserTagGrants(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+
+  const grants: UserTagGrants = {};
+  for (const [user, tags] of Object.entries(value)) {
+    const normalizedUser = cleanOwner(user);
+    if (!normalizedUser) continue;
+    grants[normalizedUser] = cleanTags(tags);
+  }
+
+  return grants;
+}
+
+export async function getUserTagGrants(storage: ObjectStorage) {
+  return normalizeUserTagGrants(await readJson<UserTagGrants>(storage, PERMISSIONS_KEY));
+}
+
+export async function setUserVisibleTags(storage: ObjectStorage, user: string, tags: string[]) {
+  const normalizedUser = cleanOwner(user);
+  if (!normalizedUser) throw new AppError("用户无效");
+
+  const grants = await getUserTagGrants(storage);
+  grants[normalizedUser] = cleanTags(tags);
+  await writeJson(storage, PERMISSIONS_KEY, grants);
+  return grants[normalizedUser];
 }
 
 function normalizeShareCode(value: string) {

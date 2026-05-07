@@ -1,6 +1,7 @@
 interface Env {
   DRIVE_BUCKET?: R2Bucket;
   STORAGE_BACKEND?: "r2" | "s3";
+  AUTH_USERS?: string;
   S3_BUCKET?: string;
   S3_REGION?: string;
   S3_ENDPOINT?: string;

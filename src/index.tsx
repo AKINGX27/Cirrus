@@ -9,23 +9,46 @@ import {
   deleteDriveFile,
   getActiveFileMeta,
   getShare,
+  getUserTagGrants,
   incrementDownload,
   listFiles,
   objectKey,
   cleanDescription,
+  cleanTags,
   parseOptionalDate,
   renameFile,
   resolveShareFiles,
+  setUserVisibleTags,
   updateFileDescription,
+  updateFileTags,
   verifySharePassword,
   type CreateShareInput,
   type DriveFileMeta,
+  type UserTagGrants,
 } from "./storage";
 import { createStoredZipStream } from "./zip";
 
-type Bindings = StorageEnv;
+type UserRole = "admin" | "user";
 
-const app = new Hono<{ Bindings: Bindings }>();
+interface AuthEnv {
+  AUTH_USERS?: string;
+}
+
+interface AuthUser {
+  name: string;
+  password: string;
+  role: UserRole;
+}
+
+interface AuthSession {
+  name: string;
+  role: UserRole;
+  configured: boolean;
+}
+
+type Bindings = StorageEnv & AuthEnv;
+
+const app = new Hono<{ Bindings: Bindings; Variables: { session: AuthSession } }>();
 
 function jsonError(error: unknown) {
   if (error instanceof AppError) {
@@ -74,6 +97,154 @@ function idsFromValue(value: unknown) {
   const ids = value.filter((id): id is string => typeof id === "string" && id.length > 0);
   if (!ids.length) throw new AppError("请选择文件");
   return Array.from(new Set(ids));
+}
+
+function parseAuthUsers(value: string | undefined) {
+  const users: AuthUser[] = [];
+
+  for (const entry of (value || "").split(",")) {
+    const [rawName, password = "", rawRole = "user"] = entry.split(":");
+    const name = rawName?.trim();
+    const role = rawRole.trim().toLowerCase() === "admin" ? "admin" : "user";
+
+    if (!name || !password) continue;
+    users.push({ name, password, role });
+  }
+
+  return users;
+}
+
+function timingSafeEqual(a: string, b: string) {
+  const encoder = new TextEncoder();
+  const left = encoder.encode(a);
+  const right = encoder.encode(b);
+  const length = Math.max(left.length, right.length);
+  let diff = left.length ^ right.length;
+
+  for (let index = 0; index < length; index += 1) {
+    diff |= (left[index] || 0) ^ (right[index] || 0);
+  }
+
+  return diff === 0;
+}
+
+function unauthorizedResponse() {
+  return new Response("Authentication required", {
+    status: 401,
+    headers: {
+      "WWW-Authenticate": 'Basic realm="Cirrus Drive", charset="UTF-8"',
+    },
+  });
+}
+
+function authenticate(request: Request, env: Bindings): AuthSession | null {
+  const users = parseAuthUsers(env.AUTH_USERS);
+  if (!users.length) {
+    return { name: "admin", role: "admin", configured: false };
+  }
+
+  const header = request.headers.get("Authorization") || "";
+  if (!header.startsWith("Basic ")) return null;
+
+  let decoded = "";
+  try {
+    decoded = atob(header.slice(6));
+  } catch {
+    return null;
+  }
+
+  const separator = decoded.indexOf(":");
+  if (separator < 0) return null;
+
+  const name = decoded.slice(0, separator);
+  const password = decoded.slice(separator + 1);
+  const user = users.find((item) => item.name === name);
+  if (!user || !timingSafeEqual(user.password, password)) return null;
+
+  return { name: user.name, role: user.role, configured: true };
+}
+
+function fileMatchesVisibleTags(file: DriveFileMeta, tags: string[]) {
+  const granted = new Set(tags.map((tag) => tag.toLocaleLowerCase()));
+  return file.tags.some((tag) => granted.has(tag.toLocaleLowerCase()));
+}
+
+function canManageFile(session: AuthSession, file: DriveFileMeta) {
+  return session.role === "admin" || file.owner === session.name;
+}
+
+function requireManageFile(session: AuthSession, file: DriveFileMeta | null) {
+  if (!file) throw new AppError("文件不存在", 404);
+  if (!canManageFile(session, file)) throw new AppError("无权操作该文件", 403);
+  return file;
+}
+
+function requireAdmin(session: AuthSession) {
+  if (session.role !== "admin") throw new AppError("需要管理员权限", 403);
+}
+
+async function visibleFiles(storage: ObjectStorage, session: AuthSession) {
+  const files = await listFiles(storage);
+  if (session.role === "admin") return files;
+
+  const grants = await getUserTagGrants(storage);
+  const visibleTags = grants[session.name] || [];
+
+  return files.filter((file) => file.owner === session.name || fileMatchesVisibleTags(file, visibleTags));
+}
+
+function fileExtension(name: string) {
+  const dot = name.lastIndexOf(".");
+  if (dot <= 0 || dot === name.length - 1) return "";
+  return name.slice(dot + 1);
+}
+
+function matchesSearch(file: DriveFileMeta, query: string) {
+  const normalized = query.trim().toLocaleLowerCase();
+  if (!normalized) return true;
+
+  const haystack = [
+    file.name,
+    file.description,
+    fileExtension(file.name),
+    ...file.tags,
+  ].join(" ").toLocaleLowerCase();
+
+  return haystack.includes(normalized);
+}
+
+function matchesTag(file: DriveFileMeta, tag: string) {
+  const normalized = tag.trim().toLocaleLowerCase();
+  if (!normalized) return true;
+  return file.tags.some((item) => item.toLocaleLowerCase() === normalized);
+}
+
+function filterFiles(files: DriveFileMeta[], search: string | undefined, tag: string | undefined) {
+  return files.filter((file) => matchesSearch(file, search || "") && matchesTag(file, tag || ""));
+}
+
+function userNamesFromEnv(env: Bindings) {
+  return parseAuthUsers(env.AUTH_USERS)
+    .filter((user) => user.role !== "admin")
+    .map((user) => user.name);
+}
+
+function knownTags(files: DriveFileMeta[], grants: UserTagGrants) {
+  const tags = new Map<string, string>();
+
+  for (const file of files) {
+    for (const tag of file.tags) {
+      tags.set(tag.toLocaleLowerCase(), tag);
+    }
+  }
+
+  for (const userTags of Object.values(grants)) {
+    for (const tag of userTags) {
+      tags.set(tag.toLocaleLowerCase(), tag);
+    }
+  }
+
+  return Array.from(tags.values()).sort((a, b) => a.localeCompare(b, "zh-CN"));
 }
 
 async function zipResponse(storage: ObjectStorage, files: DriveFileMeta[], archiveName: string) {
@@ -136,7 +307,26 @@ app.use(
   }),
 );
 
-app.get("/", (c) => c.render(<DriveApp storageName={storageLabel(c.env)} />));
+app.use("/api/*", async (c, next) => {
+  const path = new URL(c.req.url).pathname;
+  const isPublicShareRead = c.req.method === "GET" && /^\/api\/shares\/[^/]+$/.test(path);
+  const isPublicShareDownload = c.req.method === "POST" && /^\/api\/shares\/[^/]+\/download$/.test(path);
+  if (isPublicShareRead || isPublicShareDownload) {
+    await next();
+    return;
+  }
+
+  const session = authenticate(c.req.raw, c.env);
+  if (!session) return unauthorizedResponse();
+  c.set("session", session);
+  await next();
+});
+
+app.get("/", (c) => {
+  const session = authenticate(c.req.raw, c.env);
+  if (!session) return unauthorizedResponse();
+  return c.render(<DriveApp storageName={storageLabel(c.env)} session={session} />);
+});
 
 app.get("/s/:code", (c) => {
   const code = c.req.param("code");
@@ -145,7 +335,7 @@ app.get("/s/:code", (c) => {
 
 app.get("/api/files", async (c) => {
   const storage = createObjectStorage(c.env);
-  const files = await listFiles(storage);
+  const files = filterFiles(await visibleFiles(storage, c.get("session")), c.req.query("q"), c.req.query("tag"));
   return c.json({ files });
 });
 
@@ -160,11 +350,14 @@ app.post("/api/files", async (c) => {
     }
 
     const storage = createObjectStorage(c.env);
+    const session = c.get("session");
     const fallbackDescription = cleanDescription(form.get("description"));
+    const fallbackTags = cleanTags(form.get("tags"));
     const uploaded = await Promise.all(
       files.map((file, index) => {
         const description = cleanDescription(form.get(`description:${index}`)) || fallbackDescription;
-        return createFileFromUpload(storage, file, expiresAt, description);
+        const tags = cleanTags(form.get(`tags:${index}`));
+        return createFileFromUpload(storage, file, expiresAt, description, tags.length ? tags : fallbackTags, session.name);
       }),
     );
 
@@ -179,7 +372,21 @@ app.patch("/api/files/:id/description", async (c) => {
   try {
     const body = await jsonBody<{ description?: unknown }>(c.req.raw);
     const storage = createObjectStorage(c.env);
+    requireManageFile(c.get("session"), await getActiveFileMeta(storage, c.req.param("id")));
     const file = await updateFileDescription(storage, c.req.param("id"), cleanDescription(body.description));
+    return c.json({ file });
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
+
+app.patch("/api/files/:id/tags", async (c) => {
+  try {
+    const body = await jsonBody<{ tags?: unknown }>(c.req.raw);
+    const storage = createObjectStorage(c.env);
+    requireManageFile(c.get("session"), await getActiveFileMeta(storage, c.req.param("id")));
+    const file = await updateFileTags(storage, c.req.param("id"), cleanTags(body.tags));
     return c.json({ file });
   } catch (error) {
     const { message, status } = jsonError(error);
@@ -194,6 +401,7 @@ app.patch("/api/files/:id", async (c) => {
       throw new AppError("请输入文件名");
     }
     const storage = createObjectStorage(c.env);
+    requireManageFile(c.get("session"), await getActiveFileMeta(storage, c.req.param("id")));
     const file = await renameFile(storage, c.req.param("id"), body.name);
     return c.json({ file });
   } catch (error) {
@@ -207,6 +415,11 @@ app.delete("/api/files", async (c) => {
     const body = await jsonBody<{ ids?: unknown }>(c.req.raw);
     const ids = idsFromValue(body.ids);
     const storage = createObjectStorage(c.env);
+    const session = c.get("session");
+    const files = await Promise.all(ids.map((id) => getActiveFileMeta(storage, id)));
+    for (const file of files) {
+      requireManageFile(session, file);
+    }
     await Promise.all(ids.map((id) => deleteDriveFile(storage, id)));
     return c.json({ ok: true });
   } catch (error) {
@@ -220,7 +433,12 @@ app.post("/api/files/copy", async (c) => {
     const body = await jsonBody<{ ids?: unknown }>(c.req.raw);
     const ids = idsFromValue(body.ids);
     const storage = createObjectStorage(c.env);
-    const files = await copyFiles(storage, ids);
+    const session = c.get("session");
+    const sources = await Promise.all(ids.map((id) => getActiveFileMeta(storage, id)));
+    for (const file of sources) {
+      requireManageFile(session, file);
+    }
+    const files = await copyFiles(storage, ids, session.name);
     return c.json({ files });
   } catch (error) {
     const { message, status } = jsonError(error);
@@ -233,6 +451,9 @@ app.get("/api/files/:id/download", async (c) => {
     const storage = createObjectStorage(c.env);
     const file = await getActiveFileMeta(storage, c.req.param("id"));
     if (!file) throw new AppError("文件不存在", 404);
+    if (!(await visibleFiles(storage, c.get("session"))).some((item) => item.id === file.id)) {
+      throw new AppError("文件不存在", 404);
+    }
     return singleFileResponse(storage, file);
   } catch (error) {
     const { message, status } = jsonError(error);
@@ -245,9 +466,9 @@ app.post("/api/files/download", async (c) => {
     const body = await jsonBody<{ ids?: unknown }>(c.req.raw);
     const ids = idsFromValue(body.ids);
     const storage = createObjectStorage(c.env);
-    const files = (
-      await Promise.all(ids.map((id) => getActiveFileMeta(storage, id)))
-    ).filter(Boolean) as DriveFileMeta[];
+    const allowed = new Map((await visibleFiles(storage, c.get("session"))).map((file) => [file.id, file]));
+    const files = ids.map((id) => allowed.get(id)).filter(Boolean) as DriveFileMeta[];
+    if (files.length !== ids.length) throw new AppError("文件不存在或无权下载", 404);
 
     if (files.length === 1) {
       return singleFileResponse(storage, files[0]);
@@ -277,6 +498,9 @@ app.post("/api/shares", async (c) => {
     };
 
     const storage = createObjectStorage(c.env);
+    const allowed = new Set((await visibleFiles(storage, c.get("session"))).map((file) => file.id));
+    const unauthorized = input.fileIds.some((id) => !allowed.has(id));
+    if (unauthorized) throw new AppError("无权分享所选文件", 403);
     const share = await createShare(storage, input);
     return c.json({
       share: {
@@ -348,9 +572,47 @@ app.post("/api/shares/:code/download", async (c) => {
   }
 });
 
-function DriveApp({ storageName }: { storageName: string }) {
+app.get("/api/admin/permissions", async (c) => {
+  try {
+    requireAdmin(c.get("session"));
+    const storage = createObjectStorage(c.env);
+    const files = await listFiles(storage);
+    const grants = await getUserTagGrants(storage);
+
+    return c.json({
+      users: userNamesFromEnv(c.env),
+      grants,
+      tags: knownTags(files, grants),
+    });
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
+
+app.patch("/api/admin/permissions/:user", async (c) => {
+  try {
+    requireAdmin(c.get("session"));
+    const body = await jsonBody<{ tags?: unknown }>(c.req.raw);
+    const storage = createObjectStorage(c.env);
+    const tags = await setUserVisibleTags(storage, c.req.param("user"), cleanTags(body.tags));
+
+    return c.json({ user: c.req.param("user"), tags });
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
+
+function DriveApp({ storageName, session }: { storageName: string; session: AuthSession }) {
   return (
-    <main class="app-shell" data-app="drive">
+    <main
+      class="app-shell"
+      data-app="drive"
+      data-role={session.role}
+      data-user={session.name}
+      data-auth-configured={String(session.configured)}
+    >
       <aside class="side-rail">
         <a class="brand" href="/" aria-label="Cirrus Drive">
           <span class="brand-mark">C</span>
@@ -369,10 +631,16 @@ function DriveApp({ storageName }: { storageName: string }) {
           <button class="nav-item" type="button" data-action="paste" disabled>
             <span>粘贴</span>
           </button>
+          {session.role === "admin" ? (
+            <button class="nav-item" type="button" data-action="manage-permissions">
+              <span>权限管理</span>
+            </button>
+          ) : null}
         </nav>
         <div class="storage-card">
           <span>{storageName}</span>
           <strong id="storage-count">0 个文件</strong>
+          <small id="user-badge">{session.role === "admin" ? `管理员 ${session.name}` : session.name}</small>
         </div>
       </aside>
 
@@ -386,6 +654,8 @@ function DriveApp({ storageName }: { storageName: string }) {
         </header>
 
         <div class="command-bar" role="toolbar" aria-label="文件操作">
+          <input id="file-search" type="search" placeholder="搜索文件名、标签、描述、扩展名" autocomplete="off" />
+          <button type="button" id="clear-filter-button" hidden>清除筛选</button>
           <button type="button" data-action="download-selected" disabled>下载</button>
           <button type="button" data-action="share-selected" disabled>分享</button>
           <button type="button" data-action="copy-selected" disabled>复制</button>
@@ -399,6 +669,7 @@ function DriveApp({ storageName }: { storageName: string }) {
           <div class="table-head" aria-hidden="true">
             <span>名称</span>
             <span>描述</span>
+            <span>标签</span>
             <span>上传时间</span>
             <span>最后下载</span>
             <span>下载次数</span>
@@ -415,6 +686,7 @@ function DriveApp({ storageName }: { storageName: string }) {
       <div id="context-menu" class="context-menu" hidden>
         <button type="button" data-menu-action="rename">改名</button>
         <button type="button" data-menu-action="description">修改描述</button>
+        <button type="button" data-menu-action="tags">修改标签</button>
         <button type="button" data-menu-action="download">下载</button>
         <button type="button" data-menu-action="select">选择</button>
         <button type="button" data-menu-action="copy">复制</button>
@@ -436,7 +708,16 @@ function DriveApp({ storageName }: { storageName: string }) {
             <span>批量描述</span>
             <textarea id="bulk-description" maxLength={500} rows={3} placeholder="输入后可应用到全部文件"></textarea>
           </label>
-          <button type="button" id="apply-bulk-description" disabled>应用到全部</button>
+          <div class="bulk-tools">
+            <label>
+              <span>批量标签</span>
+              <input id="bulk-tags" placeholder="多个标签用逗号分隔" autocomplete="off" />
+            </label>
+            <div>
+              <button type="button" id="apply-bulk-description" disabled>应用描述</button>
+              <button type="button" id="apply-bulk-tags" disabled>应用标签</button>
+            </div>
+          </div>
           <div id="upload-file-list" class="upload-file-list"></div>
           <label>
             <span>存留时间</span>
@@ -455,6 +736,30 @@ function DriveApp({ storageName }: { storageName: string }) {
           </footer>
         </form>
       </dialog>
+
+      {session.role === "admin" ? (
+        <dialog id="permission-dialog" class="modal permission-modal">
+          <form method="dialog" class="modal-panel" id="permission-form">
+            <header>
+              <h2>权限管理</h2>
+              <button value="cancel" aria-label="关闭">×</button>
+            </header>
+            <label>
+              <span>用户</span>
+              <select id="permission-user"></select>
+            </label>
+            <label>
+              <span>可见标签</span>
+              <input id="permission-tags" placeholder="多个标签用逗号分隔" autocomplete="off" />
+            </label>
+            <div id="known-tags" class="tag-suggestions"></div>
+            <footer>
+              <button value="cancel">取消</button>
+              <button id="save-permission-button" value="default">保存权限</button>
+            </footer>
+          </form>
+        </dialog>
+      ) : null}
 
       <dialog id="share-dialog" class="modal">
         <form method="dialog" class="modal-panel" id="share-form">
@@ -708,6 +1013,13 @@ textarea {
   display: block;
 }
 
+.storage-card small {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
 .storage-card span,
 .eyebrow,
 .table-head,
@@ -785,6 +1097,11 @@ h2 {
   padding: 0 12px;
 }
 
+.command-bar input {
+  flex: 1 1 280px;
+  min-width: 220px;
+}
+
 .command-bar span {
   margin-left: auto;
   white-space: nowrap;
@@ -804,7 +1121,7 @@ h2 {
 .table-head,
 .file-row {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) minmax(180px, 0.78fr) minmax(150px, 0.45fr) minmax(150px, 0.45fr) 112px;
+  grid-template-columns: minmax(220px, 1fr) minmax(170px, 0.65fr) minmax(150px, 0.54fr) minmax(145px, 0.42fr) minmax(145px, 0.42fr) 96px;
   align-items: center;
   gap: 12px;
 }
@@ -834,6 +1151,9 @@ h2 {
   border: 0;
   border-bottom: 1px solid color-mix(in srgb, var(--line), transparent 35%);
   border-radius: 0;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
   background: transparent;
   text-align: left;
   transform: none;
@@ -886,6 +1206,35 @@ h2 {
   color: var(--muted);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.file-tags,
+.tag-suggestions {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tag-chip {
+  min-height: 24px;
+  border: 1px solid color-mix(in srgb, var(--accent), var(--line) 50%);
+  border-radius: 999px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent), transparent 88%);
+  padding: 2px 8px;
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.tag-chip[role="button"],
+button.tag-chip {
+  cursor: pointer;
+}
+
+.tag-empty {
+  color: var(--muted);
+  font-size: 0.86rem;
 }
 
 .empty-state {
@@ -1002,7 +1351,7 @@ h2 {
 
 .upload-file-row {
   display: grid;
-  grid-template-columns: minmax(160px, 0.75fr) minmax(220px, 1fr);
+  grid-template-columns: minmax(150px, 0.65fr) minmax(190px, 1fr) minmax(170px, 0.8fr);
   gap: 10px;
   padding: 10px 12px;
   border-bottom: 1px solid color-mix(in srgb, var(--line), transparent 35%);
@@ -1031,6 +1380,29 @@ h2 {
 
 .upload-file-row textarea {
   min-height: 74px;
+}
+
+.bulk-tools {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto;
+  align-items: end;
+  gap: 10px;
+}
+
+.bulk-tools > div {
+  display: flex;
+  gap: 8px;
+}
+
+.permission-modal {
+  width: min(560px, calc(100vw - 28px));
+}
+
+.tag-suggestions {
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--glass);
 }
 
 .share-shell {
@@ -1115,10 +1487,11 @@ h2 {
     grid-template-areas:
       "name count"
       "description description"
+      "tags tags"
       "uploaded uploaded"
       "downloaded downloaded";
     gap: 4px 12px;
-    min-height: 104px;
+    min-height: 122px;
     padding: 12px;
   }
 
@@ -1131,14 +1504,18 @@ h2 {
   }
 
   .file-row > :nth-child(3) {
-    grid-area: uploaded;
+    grid-area: tags;
   }
 
   .file-row > :nth-child(4) {
-    grid-area: downloaded;
+    grid-area: uploaded;
   }
 
   .file-row > :nth-child(5) {
+    grid-area: downloaded;
+  }
+
+  .file-row > :nth-child(6) {
     grid-area: count;
     text-align: right;
   }
@@ -1160,6 +1537,7 @@ h2 {
 
   .command-bar {
     align-items: stretch;
+    flex-wrap: wrap;
   }
 
   .command-bar span {
@@ -1173,6 +1551,10 @@ h2 {
   .upload-file-row {
     grid-template-columns: 1fr;
   }
+
+  .bulk-tools {
+    grid-template-columns: 1fr;
+  }
 }
 `;
 
@@ -1183,26 +1565,41 @@ const clientScript = String.raw`
     selected: new Set(),
     clipboard: null,
     contextId: null,
-    dragging: null
+    dragging: null,
+    query: "",
+    tag: ""
   };
 
+  const appRoot = document.querySelector("[data-app='drive']");
+  const isAdmin = appRoot?.dataset.role === "admin";
   const list = document.getElementById("file-list");
   const surface = document.getElementById("file-surface");
   const empty = document.getElementById("empty-state");
   const menu = document.getElementById("context-menu");
   const summary = document.getElementById("selection-summary");
   const storageCount = document.getElementById("storage-count");
+  const searchInput = document.getElementById("file-search");
+  const clearFilterButton = document.getElementById("clear-filter-button");
   const uploadDialog = document.getElementById("upload-dialog");
   const uploadForm = document.getElementById("upload-form");
   const fileInput = document.getElementById("file-input");
   const bulkDescription = document.getElementById("bulk-description");
+  const bulkTags = document.getElementById("bulk-tags");
   const applyBulkDescription = document.getElementById("apply-bulk-description");
+  const applyBulkTags = document.getElementById("apply-bulk-tags");
   const uploadFileList = document.getElementById("upload-file-list");
   const confirmUploadButton = document.getElementById("confirm-upload-button");
   const shareDialog = document.getElementById("share-dialog");
   const shareForm = document.getElementById("share-form");
+  const permissionDialog = document.getElementById("permission-dialog");
+  const permissionForm = document.getElementById("permission-form");
+  const permissionUser = document.getElementById("permission-user");
+  const permissionTags = document.getElementById("permission-tags");
+  const knownTags = document.getElementById("known-tags");
   const selectionBox = document.getElementById("selection-box");
   let pendingUploads = [];
+  let permissions = { users: [], grants: {}, tags: [] };
+  let selectedPermissionUser = "";
 
   const buttons = {
     download: document.querySelector('[data-action="download-selected"]'),
@@ -1265,6 +1662,30 @@ const clientScript = String.raw`
     return match ? match[1].slice(0, 4).toUpperCase() : "FILE";
   }
 
+  function parseTags(value) {
+    const seen = new Set();
+    const tags = [];
+    for (const raw of String(value || "").split(/[,，\\n]+/)) {
+      const tag = raw.replace(/[\\u0000-\\u001f\\u007f]+/g, " ").replace(/\\s+/g, " ").trim().slice(0, 32);
+      const key = tag.toLocaleLowerCase();
+      if (!tag || seen.has(key)) continue;
+      seen.add(key);
+      tags.push(tag);
+      if (tags.length >= 20) break;
+    }
+    return tags;
+  }
+
+  function tagsToText(tags) {
+    return (tags || []).join(", ");
+  }
+
+  function setTagFilter(tag) {
+    state.tag = tag || "";
+    clearFilterButton.hidden = !state.tag && !state.query;
+    loadFiles().catch((error) => notify(error.message, "error"));
+  }
+
   function selectedFiles() {
     return state.files.filter((file) => state.selected.has(file.id));
   }
@@ -1276,8 +1697,43 @@ const clientScript = String.raw`
     }
     buttons.rename.disabled = count !== 1;
     buttons.paste.disabled = !state.clipboard;
-    summary.textContent = count ? "已选择 " + count + " 个文件" : "未选择文件";
+    summary.textContent = count
+      ? "已选择 " + count + " 个文件"
+      : state.tag
+        ? "已筛选标签：" + state.tag
+        : "未选择文件";
     storageCount.textContent = state.files.length + " 个文件";
+    clearFilterButton.hidden = !state.tag && !state.query;
+  }
+
+  function renderTags(container, tags) {
+    container.innerHTML = "";
+    if (!tags?.length) {
+      const emptyTag = document.createElement("span");
+      emptyTag.className = "tag-empty";
+      emptyTag.textContent = "无标签";
+      container.append(emptyTag);
+      return;
+    }
+
+    for (const tag of tags) {
+      const chip = document.createElement("span");
+      chip.className = "tag-chip";
+      chip.role = "button";
+      chip.tabIndex = 0;
+      chip.textContent = tag;
+      chip.addEventListener("click", (event) => {
+        event.stopPropagation();
+        setTagFilter(tag);
+      });
+      chip.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        event.stopPropagation();
+        setTagFilter(tag);
+      });
+      container.append(chip);
+    }
   }
 
   function render() {
@@ -1302,11 +1758,13 @@ const clientScript = String.raw`
           '</span>' +
         '</span>' +
         '<span class="file-description"></span>' +
+        '<span class="file-tags"></span>' +
         '<span>' + formatDate(file.uploadedAt) + '</span>' +
         '<span>' + formatDate(file.lastDownloadedAt) + '</span>' +
         '<span>' + file.downloadCount + '</span>';
       row.querySelector(".file-title").textContent = file.name;
       row.querySelector(".file-description").textContent = file.description || "无描述";
+      renderTags(row.querySelector(".file-tags"), file.tags || []);
 
       row.addEventListener("click", (event) => {
         if (event.shiftKey || event.metaKey || event.ctrlKey) {
@@ -1356,7 +1814,10 @@ const clientScript = String.raw`
 
   async function loadFiles() {
     notify("正在读取文件...");
-    const data = await api("/api/files");
+    const url = new URL("/api/files", location.origin);
+    if (state.query) url.searchParams.set("q", state.query);
+    if (state.tag) url.searchParams.set("tag", state.tag);
+    const data = await api(url.pathname + url.search);
     state.files = data.files || [];
     state.selected.clear();
     render();
@@ -1382,23 +1843,31 @@ const clientScript = String.raw`
           '<strong></strong>' +
           '<small>' + formatSize(item.file.size) + '</small>' +
         '</span>' +
-        '<textarea maxlength="500" rows="3" placeholder="该文件的描述"></textarea>';
+        '<textarea maxlength="500" rows="3" placeholder="该文件的描述"></textarea>' +
+        '<input placeholder="该文件的标签" autocomplete="off" />';
       row.querySelector("strong").textContent = item.file.name;
       const textarea = row.querySelector("textarea");
       textarea.value = item.description;
       textarea.addEventListener("input", () => {
         item.description = textarea.value;
       });
+      const tagInput = row.querySelector("input");
+      tagInput.value = tagsToText(item.tags);
+      tagInput.addEventListener("input", () => {
+        item.tags = parseTags(tagInput.value);
+      });
       uploadFileList.append(row);
     }
     confirmUploadButton.disabled = pendingUploads.length === 0;
     applyBulkDescription.disabled = pendingUploads.length === 0;
+    applyBulkTags.disabled = pendingUploads.length === 0;
   }
 
   function resetUploadDialog() {
     pendingUploads = [];
     fileInput.value = "";
     bulkDescription.value = "";
+    bulkTags.value = "";
     document.getElementById("retention-select").value = "";
     document.getElementById("custom-expiry").value = "";
     document.getElementById("custom-expiry").hidden = true;
@@ -1413,7 +1882,8 @@ const clientScript = String.raw`
   function updatePendingFiles() {
     pendingUploads = Array.from(fileInput.files || []).map((file) => ({
       file,
-      description: bulkDescription.value
+      description: bulkDescription.value,
+      tags: parseTags(bulkTags.value)
     }));
     renderPendingUploads();
   }
@@ -1421,6 +1891,14 @@ const clientScript = String.raw`
   function applyBulkDescriptionToFiles() {
     for (const item of pendingUploads) {
       item.description = bulkDescription.value;
+    }
+    renderPendingUploads();
+  }
+
+  function applyBulkTagsToFiles() {
+    const tags = parseTags(bulkTags.value);
+    for (const item of pendingUploads) {
+      item.tags = tags.slice();
     }
     renderPendingUploads();
   }
@@ -1434,7 +1912,10 @@ const clientScript = String.raw`
     uploads.forEach((item, index) => {
       form.append("files", item.file);
       form.append("description:" + index, item.description);
+      form.append("tags:" + index, tagsToText(item.tags));
     });
+    form.append("description", bulkDescription.value);
+    form.append("tags", bulkTags.value);
     form.append("expiresAt", getExpiryValue());
 
     notify("正在上传 " + uploads.length + " 个文件...");
@@ -1501,6 +1982,18 @@ const clientScript = String.raw`
     await api("/api/files/" + encodeURIComponent(file.id) + "/description", {
       method: "PATCH",
       body: JSON.stringify({ description })
+    });
+    await loadFiles();
+  }
+
+  async function editTagsSelected() {
+    const file = selectedFiles()[0];
+    if (!file || state.selected.size !== 1) return;
+    const tags = prompt("输入文件标签，多个标签用逗号分隔", tagsToText(file.tags));
+    if (tags === null || tags === tagsToText(file.tags)) return;
+    await api("/api/files/" + encodeURIComponent(file.id) + "/tags", {
+      method: "PATCH",
+      body: JSON.stringify({ tags: parseTags(tags) })
     });
     await loadFiles();
   }
@@ -1581,6 +2074,78 @@ const clientScript = String.raw`
     notify("分享链接已生成");
   }
 
+  function renderPermissionForm() {
+    if (!permissionUser || !permissionTags || !knownTags) return;
+
+    const currentUser = selectedPermissionUser || permissionUser.value;
+    permissionUser.innerHTML = "";
+    for (const user of permissions.users) {
+      const option = document.createElement("option");
+      option.value = user;
+      option.textContent = user;
+      permissionUser.append(option);
+    }
+
+    const selectedUser = permissions.users.includes(currentUser) ? currentUser : permissions.users[0] || "";
+    selectedPermissionUser = selectedUser;
+    permissionUser.value = selectedUser;
+    permissionTags.value = tagsToText(permissions.grants[selectedUser] || []);
+
+    knownTags.innerHTML = "";
+    if (!permissions.tags.length) {
+      const emptyTag = document.createElement("span");
+      emptyTag.className = "tag-empty";
+      emptyTag.textContent = "暂无可选标签";
+      knownTags.append(emptyTag);
+      return;
+    }
+
+    for (const tag of permissions.tags) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "tag-chip";
+      chip.textContent = tag;
+      chip.addEventListener("click", () => {
+        const tags = parseTags(permissionTags.value);
+        if (!tags.some((item) => item.toLocaleLowerCase() === tag.toLocaleLowerCase())) {
+          tags.push(tag);
+        }
+        permissionTags.value = tagsToText(tags);
+      });
+      knownTags.append(chip);
+    }
+  }
+
+  async function openPermissionDialog() {
+    if (!isAdmin || !permissionDialog) return;
+    const data = await api("/api/admin/permissions");
+    permissions = {
+      users: data.users || [],
+      grants: data.grants || {},
+      tags: data.tags || []
+    };
+    selectedPermissionUser = permissions.users.includes(selectedPermissionUser)
+      ? selectedPermissionUser
+      : permissions.users[0] || "";
+    renderPermissionForm();
+    permissionDialog.showModal();
+  }
+
+  async function savePermissions(event) {
+    event.preventDefault();
+    if (!permissionUser.value) {
+      notify("没有普通用户可配置", "error");
+      return;
+    }
+    const data = await api("/api/admin/permissions/" + encodeURIComponent(permissionUser.value), {
+      method: "PATCH",
+      body: JSON.stringify({ tags: parseTags(permissionTags.value) })
+    });
+    permissions.grants[data.user] = data.tags || [];
+    permissionDialog.close();
+    notify("权限已保存");
+  }
+
   function updateSelectionBox(start, current) {
     const left = Math.min(start.x, current.x);
     const top = Math.min(start.y, current.y);
@@ -1633,14 +2198,35 @@ const clientScript = String.raw`
     if (!event.target.closest(".context-menu")) hideMenu();
   });
 
+  let searchTimer = 0;
+  searchInput.addEventListener("input", () => {
+    state.query = searchInput.value.trim();
+    window.clearTimeout(searchTimer);
+    searchTimer = window.setTimeout(() => {
+      loadFiles().catch((error) => notify(error.message, "error"));
+    }, 180);
+  });
+  clearFilterButton.addEventListener("click", () => {
+    state.query = "";
+    state.tag = "";
+    searchInput.value = "";
+    loadFiles().catch((error) => notify(error.message, "error"));
+  });
   document.getElementById("retention-select").addEventListener("change", (event) => {
     document.getElementById("custom-expiry").hidden = event.target.value !== "custom";
   });
   document.querySelector('[data-action="open-upload"]').addEventListener("click", openUploadDialog);
   fileInput.addEventListener("change", updatePendingFiles);
   applyBulkDescription.addEventListener("click", applyBulkDescriptionToFiles);
+  applyBulkTags.addEventListener("click", applyBulkTagsToFiles);
   uploadForm.addEventListener("submit", (event) => uploadSelected(event).catch((error) => notify(error.message, "error")));
   document.querySelector('[data-action="refresh"]').addEventListener("click", () => loadFiles().catch((error) => notify(error.message, "error")));
+  document.querySelector('[data-action="manage-permissions"]')?.addEventListener("click", () => openPermissionDialog().catch((error) => notify(error.message, "error")));
+  permissionUser?.addEventListener("change", () => {
+    selectedPermissionUser = permissionUser.value;
+    renderPermissionForm();
+  });
+  permissionForm?.addEventListener("submit", (event) => savePermissions(event).catch((error) => notify(error.message, "error")));
   buttons.download.addEventListener("click", () => downloadIds(Array.from(state.selected)).catch((error) => notify(error.message, "error")));
   buttons.share.addEventListener("click", openShareDialog);
   buttons.copy.addEventListener("click", () => setClipboard("copy"));
@@ -1656,6 +2242,7 @@ const clientScript = String.raw`
     hideMenu();
     if (action === "rename") renameSelected().catch((error) => notify(error.message, "error"));
     if (action === "description") editDescriptionSelected().catch((error) => notify(error.message, "error"));
+    if (action === "tags") editTagsSelected().catch((error) => notify(error.message, "error"));
     if (action === "download") downloadIds(Array.from(state.selected)).catch((error) => notify(error.message, "error"));
     if (action === "select") render();
     if (action === "copy") setClipboard("copy");
@@ -1732,11 +2319,26 @@ const shareClientScript = String.raw`
           '</span>' +
         '</span>' +
         '<span class="file-description"></span>' +
+        '<span class="file-tags"></span>' +
         '<span>' + formatDate(file.uploadedAt) + '</span>' +
         '<span>' + formatDate(file.lastDownloadedAt) + '</span>' +
         '<span>' + file.downloadCount + '</span>';
       row.querySelector(".file-title").textContent = file.name;
       row.querySelector(".file-description").textContent = file.description || "无描述";
+      const tags = row.querySelector(".file-tags");
+      if (file.tags?.length) {
+        for (const tag of file.tags) {
+          const chip = document.createElement("span");
+          chip.className = "tag-chip";
+          chip.textContent = tag;
+          tags.append(chip);
+        }
+      } else {
+        const empty = document.createElement("span");
+        empty.className = "tag-empty";
+        empty.textContent = "无标签";
+        tags.append(empty);
+      }
       row.addEventListener("click", () => download([file.id]));
       list.append(row);
     }
