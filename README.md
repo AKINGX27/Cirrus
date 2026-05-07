@@ -229,8 +229,8 @@ admin:change-me:admin,alice:alice-password:user,bob:bob-password:user
 | 类型 | 名称 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | Secret | `CSRF_SECRET` | 无 | 随机长字符串，用于 CSRF token 派生 |
-| Environment variable | `MAX_FILE_BYTES` | `262144000` | 单文件最大字节数 |
-| Environment variable | `MAX_UPLOAD_BYTES` | `262144000` | 单次上传总字节数 |
+| Environment variable | `MAX_FILE_BYTES` | `4294967296` | 单文件最大字节数，默认 4 GiB |
+| Environment variable | `MAX_UPLOAD_BYTES` | `4294967296` | 单次上传总字节数，默认 4 GiB |
 | Environment variable | `MAX_FILES_PER_UPLOAD` | `50` | 单次上传文件数量 |
 | Environment variable | `MAX_JSON_BYTES` | `65536` | JSON 请求体最大字节数 |
 | Environment variable | `MAX_SELECTED_FILES` | `500` | 批量下载、删除、复制最多文件数 |
@@ -240,6 +240,8 @@ admin:change-me:admin,alice:alice-password:user,bob:bob-password:user
 | Environment variable | `AUTH_IDENTITY_RATE_LIMIT_PER_MINUTE` | `20` | 单个客户端对同一用户名每分钟登录/注册尝试数 |
 | Environment variable | `SHARE_VERIFY_RATE_LIMIT_PER_MINUTE` | `30` | 单个客户端每分钟分享密码验证次数 |
 | Environment variable | `ALLOW_UNCONFIGURED_AUTH` | `false` | 仅本地开发建议使用，不要在公网开启 |
+
+注意：这些变量只控制应用自身的校验。实际能上传多大的文件，还会受到 Cloudflare 账户和 Zone 的 HTTP 请求体大小限制影响；如果线上仍然在到达 Worker 前失败，需要在 Cloudflare 侧升级/调整上传限制，或改成分片上传方案。
 
 ### 7. AWS S3 配置
 

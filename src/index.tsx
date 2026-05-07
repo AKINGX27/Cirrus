@@ -92,8 +92,8 @@ interface AppVariables {
 const app = new Hono<{ Bindings: Bindings; Variables: AppVariables }>();
 
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
-const DEFAULT_MAX_FILE_BYTES = 250 * 1024 * 1024;
-const DEFAULT_MAX_UPLOAD_BYTES = 250 * 1024 * 1024;
+const DEFAULT_MAX_FILE_BYTES = 4 * 1024 * 1024 * 1024;
+const DEFAULT_MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_FILES_PER_UPLOAD = 50;
 const DEFAULT_MAX_JSON_BYTES = 64 * 1024;
 const DEFAULT_MAX_SELECTED_FILES = 500;
