@@ -1903,9 +1903,13 @@ function DriveApp({ storageName, session, nonce }: { storageName: string; sessio
             </select>
           </label>
           <input id="custom-expiry" type="datetime-local" aria-label="自定义存留到期时间" hidden />
+          <div id="upload-progress-wrap" class="upload-progress" hidden>
+            <progress id="upload-progress" max="100" value="0"></progress>
+            <output id="upload-progress-text">等待上传</output>
+          </div>
           <footer>
             <button type="button" data-action="close-dialog">取消</button>
-            <button id="confirm-upload-button" value="default" disabled>确认上传</button>
+            <button id="confirm-upload-button" type="submit" value="default" disabled>确认上传</button>
           </footer>
         </form>
       </dialog>
@@ -2712,6 +2716,38 @@ button.tag-chip {
   min-height: 74px;
 }
 
+.upload-progress {
+  display: grid;
+  gap: 6px;
+}
+
+.upload-progress progress {
+  width: 100%;
+  height: 12px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--line), transparent 45%);
+}
+
+.upload-progress progress::-webkit-progress-bar {
+  background: color-mix(in srgb, var(--line), transparent 45%);
+}
+
+.upload-progress progress::-webkit-progress-value {
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+}
+
+.upload-progress progress::-moz-progress-bar {
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+}
+
+.upload-progress output {
+  min-height: 18px;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
 .permission-modal {
   width: min(560px, calc(100vw - 28px));
 }
@@ -3195,6 +3231,9 @@ const clientScript = String.raw`
   const fileInput = document.getElementById("file-input");
   const uploadFileList = document.getElementById("upload-file-list");
   const confirmUploadButton = document.getElementById("confirm-upload-button");
+  const uploadProgressWrap = document.getElementById("upload-progress-wrap");
+  const uploadProgress = document.getElementById("upload-progress");
+  const uploadProgressText = document.getElementById("upload-progress-text");
   const notificationButton = document.querySelector('[data-action="notifications"]');
   const notificationCount = document.getElementById("notification-count");
   const notificationDialog = document.getElementById("notification-dialog");
@@ -3280,6 +3319,62 @@ const clientScript = String.raw`
     }
 
     return response.json();
+  }
+
+  function setUploadBusy(isBusy) {
+    confirmUploadButton.disabled = isBusy || pendingUploads.length === 0;
+    fileInput.disabled = isBusy;
+    document.getElementById("retention-select").disabled = isBusy;
+    document.getElementById("custom-expiry").disabled = isBusy;
+    for (const control of uploadFileList.querySelectorAll("textarea, input")) {
+      control.disabled = isBusy;
+    }
+    for (const button of uploadForm.querySelectorAll('[data-action="close-dialog"]')) {
+      button.disabled = isBusy;
+    }
+  }
+
+  function resetUploadProgress() {
+    uploadProgressWrap.hidden = true;
+    uploadProgress.value = 0;
+    uploadProgress.removeAttribute("value");
+    uploadProgressText.value = "等待上传";
+  }
+
+  function updateUploadProgress(loaded, total) {
+    uploadProgressWrap.hidden = false;
+    if (total > 0) {
+      const percent = Math.min(100, Math.max(0, Math.round((loaded / total) * 100)));
+      uploadProgress.value = percent;
+      uploadProgressText.value = "正在上传 " + percent + "% (" + formatSize(loaded) + " / " + formatSize(total) + ")";
+      return;
+    }
+    uploadProgress.removeAttribute("value");
+    uploadProgressText.value = "正在上传...";
+  }
+
+  function uploadFormData(path, form) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", path);
+      xhr.responseType = "json";
+      xhr.withCredentials = true;
+      if (csrfToken) xhr.setRequestHeader("X-CSRF-Token", csrfToken);
+      xhr.upload.addEventListener("progress", (event) => {
+        updateUploadProgress(event.loaded, event.lengthComputable ? event.total : 0);
+      });
+      xhr.addEventListener("load", () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(xhr.response || {});
+          return;
+        }
+        const data = xhr.response || {};
+        reject(new Error(data.error || "上传失败"));
+      });
+      xhr.addEventListener("error", () => reject(new Error("网络错误，上传失败")));
+      xhr.addEventListener("abort", () => reject(new Error("上传已取消")));
+      xhr.send(form);
+    });
   }
 
   async function logout() {
@@ -3827,6 +3922,8 @@ const clientScript = String.raw`
     document.getElementById("retention-select").value = "";
     document.getElementById("custom-expiry").value = "";
     document.getElementById("custom-expiry").hidden = true;
+    resetUploadProgress();
+    setUploadBusy(false);
     renderPendingUploads();
   }
 
@@ -3858,14 +3955,23 @@ const clientScript = String.raw`
     form.append("expiresAt", getExpiryValue());
 
     notify("正在上传 " + uploads.length + " 个文件...");
-    await api("/api/files", {
-      method: "POST",
-      body: form
-    });
-    uploadDialog.close();
-    resetUploadDialog();
-    await loadFiles();
-    notify("上传完成");
+    updateUploadProgress(0, uploads.reduce((sum, item) => sum + item.file.size, 0));
+    setUploadBusy(true);
+    try {
+      await uploadFormData("/api/files", form);
+      uploadProgress.value = 100;
+      uploadProgressText.value = "上传完成，正在刷新...";
+      uploadDialog.close();
+      resetUploadDialog();
+      await loadFiles();
+      notify("上传完成");
+    } catch (error) {
+      uploadProgressWrap.hidden = false;
+      uploadProgress.removeAttribute("value");
+      uploadProgressText.value = error.message || "上传失败";
+      notify(error.message || "上传失败", "error");
+      setUploadBusy(false);
+    }
   }
 
   function triggerBlobDownload(blob, fileName) {
