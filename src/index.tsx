@@ -2686,6 +2686,7 @@ button.tag-chip {
 .upload-file-row {
   display: grid;
   grid-template-columns: minmax(150px, 0.65fr) minmax(190px, 1fr) minmax(170px, 0.8fr);
+  align-items: start;
   gap: 10px;
   padding: 10px 12px;
   border-bottom: 1px solid color-mix(in srgb, var(--line), transparent 35%);
@@ -2697,6 +2698,7 @@ button.tag-chip {
 
 .upload-file-meta {
   min-width: 0;
+  padding-top: 8px;
 }
 
 .upload-file-meta strong,
@@ -2712,8 +2714,15 @@ button.tag-chip {
   font-size: 0.82rem;
 }
 
-.upload-file-row textarea {
-  min-height: 74px;
+.upload-file-row textarea,
+.upload-file-row input {
+  min-height: 86px;
+  padding-top: 14px;
+  padding-bottom: 14px;
+}
+
+.upload-file-row input {
+  align-self: stretch;
 }
 
 .upload-progress {
