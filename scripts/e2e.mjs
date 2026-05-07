@@ -629,7 +629,8 @@ test("registered users, profile settings, permissions, files, sharing, friends, 
     assertIncludes(html, 'id="context-menu" class="context-menu" hidden');
     assertIncludes(html, 'id="share-output" readonly');
     assertIncludes(html, 'id="copy-share-link-button" type="button" disabled');
-    assertIncludes(html, 'type="button" data-action="close-share-dialog">取消</button>');
+    assertIncludes(html, 'type="button" data-action="close-dialog">取消</button>');
+    assert.ok(!html.includes('value="cancel"'), "modal cancel controls should not submit forms");
     assertIncludes(html, "<span>描述</span>");
     assertIncludes(html, "<span>标签</span>");
     assertIncludes(html, "搜索文件名、标签、描述、扩展名");

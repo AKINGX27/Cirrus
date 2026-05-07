@@ -1796,7 +1796,7 @@ function DriveApp({ storageName, session, nonce }: { storageName: string; sessio
         <form method="dialog" class="modal-panel">
           <header>
             <h2>通知</h2>
-            <button value="cancel" aria-label="关闭">×</button>
+            <button type="button" data-action="close-dialog" aria-label="关闭">×</button>
           </header>
           <div id="notification-list" class="notification-list"></div>
           <footer>
@@ -1810,7 +1810,7 @@ function DriveApp({ storageName, session, nonce }: { storageName: string; sessio
         <form method="dialog" class="modal-panel" id="profile-form">
           <header>
             <h2>账号设置</h2>
-            <button value="cancel" aria-label="关闭">×</button>
+            <button type="button" data-action="close-dialog" aria-label="关闭">×</button>
           </header>
           <div class="profile-preview">
             <span id="profile-avatar-preview" class="avatar-preview"></span>
@@ -1845,7 +1845,7 @@ function DriveApp({ storageName, session, nonce }: { storageName: string; sessio
           </label>
           <output id="profile-status"></output>
           <footer>
-            <button value="cancel">取消</button>
+            <button type="button" data-action="close-dialog">取消</button>
             <button id="save-profile-button" value="default">保存资料</button>
           </footer>
         </form>
@@ -1855,7 +1855,7 @@ function DriveApp({ storageName, session, nonce }: { storageName: string; sessio
         <form method="dialog" class="modal-panel" id="friends-form">
           <header>
             <h2>好友私信</h2>
-            <button value="cancel" aria-label="关闭">×</button>
+            <button type="button" data-action="close-dialog" aria-label="关闭">×</button>
           </header>
           <div class="friends-layout">
             <section class="friends-sidebar">
@@ -1887,7 +1887,7 @@ function DriveApp({ storageName, session, nonce }: { storageName: string; sessio
         <form method="dialog" class="modal-panel" id="upload-form">
           <header>
             <h2>上传文件</h2>
-            <button value="cancel" aria-label="关闭">×</button>
+            <button type="button" data-action="close-dialog" aria-label="关闭">×</button>
           </header>
           <label class="file-picker">
             <span>选择文件</span>
@@ -1920,7 +1920,7 @@ function DriveApp({ storageName, session, nonce }: { storageName: string; sessio
           </label>
           <input id="custom-expiry" type="datetime-local" aria-label="自定义存留到期时间" hidden />
           <footer>
-            <button value="cancel">取消</button>
+            <button type="button" data-action="close-dialog">取消</button>
             <button id="confirm-upload-button" value="default" disabled>确认上传</button>
           </footer>
         </form>
@@ -1931,7 +1931,7 @@ function DriveApp({ storageName, session, nonce }: { storageName: string; sessio
           <form method="dialog" class="modal-panel" id="permission-form">
             <header>
               <h2>权限管理</h2>
-              <button value="cancel" aria-label="关闭">×</button>
+              <button type="button" data-action="close-dialog" aria-label="关闭">×</button>
             </header>
             <label>
               <span>用户</span>
@@ -1943,7 +1943,7 @@ function DriveApp({ storageName, session, nonce }: { storageName: string; sessio
             </label>
             <div id="known-tags" class="tag-suggestions"></div>
             <footer>
-              <button value="cancel">取消</button>
+              <button type="button" data-action="close-dialog">取消</button>
               <button id="save-permission-button" value="default">保存权限</button>
             </footer>
           </form>
@@ -1975,7 +1975,7 @@ function DriveApp({ storageName, session, nonce }: { storageName: string; sessio
             </div>
           </label>
           <footer>
-            <button type="button" data-action="close-share-dialog">取消</button>
+            <button type="button" data-action="close-dialog">取消</button>
             <button id="create-share-button" value="default">生成分享</button>
           </footer>
         </form>
@@ -4276,8 +4276,8 @@ const clientScript = String.raw`
   buttons.delete.addEventListener("click", () => deleteSelected().catch((error) => notify(error.message, "error")));
   buttons.paste.addEventListener("click", () => pasteClipboard().catch((error) => notify(error.message, "error")));
   copyShareLinkButton.addEventListener("click", () => copyShareLink().catch((error) => notify(error.message, "error")));
-  shareDialog.querySelectorAll('[data-action="close-share-dialog"]').forEach((button) => {
-    button.addEventListener("click", () => shareDialog.close());
+  document.querySelectorAll('[data-action="close-dialog"]').forEach((button) => {
+    button.addEventListener("click", () => button.closest("dialog")?.close());
   });
   shareForm.addEventListener("submit", (event) => createShareFromDialog(event).catch((error) => notify(error.message, "error")));
 
