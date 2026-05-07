@@ -4,6 +4,7 @@ const OBJECT_PREFIX = "objects/";
 const META_PREFIX = "meta/";
 const SHARE_PREFIX = "shares/";
 const PERMISSIONS_KEY = "permissions/tag-grants.json";
+const USER_PROFILES_KEY = "permissions/user-profiles.json";
 
 export interface DriveFileMeta {
   id: string;
@@ -39,6 +40,50 @@ export interface SetUserVisibleTagsOptions {
 }
 
 export type UserTagGrants = Record<string, string[]>;
+
+export type ManagedUserRole = "admin" | "user";
+export type MergeMode = "replace" | "add" | "remove";
+
+export interface UpdateUserTagGrantsInput {
+  users: string[];
+  tags: string[];
+  mode?: MergeMode;
+  allowedUsers?: string[];
+}
+
+export interface UserNotification {
+  id: string;
+  title: string;
+  message: string;
+  from: string;
+  createdAt: string;
+  readAt: string | null;
+}
+
+export interface UserProfile {
+  role: ManagedUserRole | null;
+  tags: string[];
+  visibleFileIds: string[];
+  notifications: UserNotification[];
+  updatedAt: string;
+}
+
+export type UserProfiles = Record<string, UserProfile>;
+
+export interface UpdateUserProfilesInput {
+  users: string[];
+  role?: ManagedUserRole | null;
+  tags?: string[];
+  tagMode?: MergeMode;
+  visibleFileIds?: string[];
+  visibleFileMode?: MergeMode;
+  notification?: {
+    title?: string;
+    message?: string;
+    from?: string;
+  } | null;
+  allowedUsers?: string[];
+}
 
 export class AppError extends Error {
   constructor(
@@ -78,6 +123,11 @@ export function cleanDescription(value: unknown) {
   return value.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 500);
 }
 
+export function cleanText(value: unknown, maxLength = 500) {
+  if (typeof value !== "string") return "";
+  return value.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, maxLength);
+}
+
 export function cleanTags(value: unknown) {
   const rawTags = Array.isArray(value)
     ? value
@@ -105,6 +155,32 @@ export function cleanTags(value: unknown) {
 function cleanOwner(value: unknown) {
   if (typeof value !== "string") return "";
   return value.replace(/[\u0000-\u001f\u007f:,\s]+/g, "").trim().slice(0, 64);
+}
+
+export function cleanUserName(value: unknown) {
+  const owner = cleanOwner(value);
+  return /^[A-Za-z0-9_.-]{1,64}$/.test(owner) ? owner : "";
+}
+
+function cleanRole(value: unknown): ManagedUserRole | null {
+  return value === "admin" || value === "user" ? value : null;
+}
+
+function cleanUuidList(value: unknown) {
+  const values = Array.isArray(value) ? value : [];
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  for (const id of values) {
+    if (typeof id !== "string" || !isUuid(id) || seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+    if (ids.length >= 1000) break;
+  }
+  return ids;
+}
+
+function isUuid(value: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
 export function isExpired(expiresAt: string | null | undefined, now = Date.now()) {
@@ -366,8 +442,185 @@ function normalizeUserTagGrants(value: unknown) {
   return grants;
 }
 
+function normalizeMergeMode(value: unknown): MergeMode {
+  return value === "add" || value === "remove" || value === "replace" ? value : "replace";
+}
+
+function mergeValues(current: string[], next: string[], mode: MergeMode) {
+  if (mode === "replace") return next;
+
+  const map = new Map(current.map((value) => [value.toLocaleLowerCase(), value]));
+  if (mode === "add") {
+    for (const value of next) {
+      map.set(value.toLocaleLowerCase(), value);
+    }
+    return Array.from(map.values());
+  }
+
+  for (const value of next) {
+    map.delete(value.toLocaleLowerCase());
+  }
+  return Array.from(map.values());
+}
+
+function mergeIds(current: string[], next: string[], mode: MergeMode) {
+  if (mode === "replace") return next;
+
+  const ids = new Set(current);
+  if (mode === "add") {
+    for (const id of next) {
+      ids.add(id);
+    }
+    return Array.from(ids);
+  }
+
+  for (const id of next) {
+    ids.delete(id);
+  }
+  return Array.from(ids);
+}
+
+function normalizeNotification(value: unknown): UserNotification | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const source = value as Partial<UserNotification>;
+  const id = typeof source.id === "string" && isUuid(source.id) ? source.id : crypto.randomUUID();
+  const title = cleanText(source.title, 80);
+  const message = cleanText(source.message, 1000);
+  if (!title && !message) return null;
+
+  return {
+    id,
+    title: title || "通知",
+    message,
+    from: cleanUserName(source.from) || "admin",
+    createdAt: typeof source.createdAt === "string" ? source.createdAt : new Date().toISOString(),
+    readAt: typeof source.readAt === "string" ? source.readAt : null,
+  };
+}
+
+function normalizeUserProfile(value: unknown): UserProfile {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? (value as Partial<UserProfile>) : {};
+  const notifications = Array.isArray(source.notifications)
+    ? source.notifications.map(normalizeNotification).filter(Boolean).slice(-100)
+    : [];
+
+  return {
+    role: cleanRole(source.role),
+    tags: cleanTags(source.tags),
+    visibleFileIds: cleanUuidList(source.visibleFileIds),
+    notifications: notifications as UserNotification[],
+    updatedAt: typeof source.updatedAt === "string" ? source.updatedAt : new Date(0).toISOString(),
+  };
+}
+
+function normalizeUserProfiles(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+
+  const profiles: UserProfiles = {};
+  for (const [user, profile] of Object.entries(value)) {
+    const normalizedUser = cleanUserName(user);
+    if (!normalizedUser) continue;
+    profiles[normalizedUser] = normalizeUserProfile(profile);
+  }
+
+  return profiles;
+}
+
 export async function getUserTagGrants(storage: ObjectStorage) {
   return normalizeUserTagGrants(await readJson<UserTagGrants>(storage, PERMISSIONS_KEY));
+}
+
+export async function updateUserTagGrants(storage: ObjectStorage, input: UpdateUserTagGrantsInput) {
+  const allowed = input.allowedUsers ? new Set(input.allowedUsers.map(cleanUserName).filter(Boolean)) : null;
+  const users = Array.from(new Set(input.users.map(cleanUserName).filter(Boolean)));
+  if (!users.length) throw new AppError("请选择用户");
+  if (allowed && users.some((user) => !allowed.has(user))) throw new AppError("只能管理已配置用户", 400);
+
+  const grants = await getUserTagGrants(storage);
+  const tags = cleanTags(input.tags);
+  const mode = normalizeMergeMode(input.mode);
+
+  for (const user of users) {
+    grants[user] = mergeValues(cleanTags(grants[user]), tags, mode).slice(0, 20);
+  }
+
+  await writeJson(storage, PERMISSIONS_KEY, grants);
+  return grants;
+}
+
+export async function getUserProfiles(storage: ObjectStorage) {
+  return normalizeUserProfiles(await readJson<UserProfiles>(storage, USER_PROFILES_KEY));
+}
+
+export async function saveUserProfiles(storage: ObjectStorage, profiles: UserProfiles) {
+  await writeJson(storage, USER_PROFILES_KEY, normalizeUserProfiles(profiles));
+}
+
+export async function updateUserProfiles(storage: ObjectStorage, input: UpdateUserProfilesInput) {
+  const allowed = input.allowedUsers ? new Set(input.allowedUsers.map(cleanUserName).filter(Boolean)) : null;
+  const users = Array.from(new Set(input.users.map(cleanUserName).filter(Boolean)));
+  if (!users.length) throw new AppError("请选择用户");
+  if (allowed && users.some((user) => !allowed.has(user))) throw new AppError("只能管理已配置用户", 400);
+
+  const profiles = await getUserProfiles(storage);
+  const role = input.role === null ? null : cleanRole(input.role);
+  const tags = cleanTags(input.tags);
+  const tagMode = normalizeMergeMode(input.tagMode);
+  const visibleFileIds = cleanUuidList(input.visibleFileIds);
+  const visibleFileMode = normalizeMergeMode(input.visibleFileMode);
+  const notification = normalizeNotification(input.notification);
+  const now = new Date().toISOString();
+
+  for (const user of users) {
+    const current = normalizeUserProfile(profiles[user]);
+    const next: UserProfile = {
+      ...current,
+      updatedAt: now,
+    };
+
+    if (input.role !== undefined) {
+      next.role = role;
+    }
+    if (input.tags !== undefined) {
+      next.tags = mergeValues(current.tags, tags, tagMode).slice(0, 20);
+    }
+    if (input.visibleFileIds !== undefined) {
+      next.visibleFileIds = mergeIds(current.visibleFileIds, visibleFileIds, visibleFileMode).slice(0, 1000);
+    }
+    if (notification) {
+      next.notifications = [...current.notifications, { ...notification, id: crypto.randomUUID(), createdAt: now }].slice(-100);
+    }
+
+    profiles[user] = next;
+  }
+
+  await saveUserProfiles(storage, profiles);
+  return profiles;
+}
+
+export async function markUserNotificationsRead(storage: ObjectStorage, user: string, ids?: string[]) {
+  const normalizedUser = cleanUserName(user);
+  if (!normalizedUser) throw new AppError("用户无效");
+
+  const profiles = await getUserProfiles(storage);
+  const profile = normalizeUserProfile(profiles[normalizedUser]);
+  const targetIds = ids && ids.length ? new Set(cleanUuidList(ids)) : null;
+  const now = new Date().toISOString();
+  let changed = false;
+
+  profile.notifications = profile.notifications.map((notification) => {
+    if (notification.readAt || (targetIds && !targetIds.has(notification.id))) return notification;
+    changed = true;
+    return { ...notification, readAt: now };
+  });
+
+  if (changed) {
+    profile.updatedAt = now;
+    profiles[normalizedUser] = profile;
+    await saveUserProfiles(storage, profiles);
+  }
+
+  return profile.notifications;
 }
 
 export async function setUserVisibleTags(

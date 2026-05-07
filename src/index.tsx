@@ -9,9 +9,11 @@ import {
   deleteDriveFile,
   getActiveFileMeta,
   getShare,
+  getUserProfiles,
   getUserTagGrants,
   incrementDownload,
   listFiles,
+  markUserNotificationsRead,
   objectKey,
   cleanDescription,
   cleanTags,
@@ -19,12 +21,16 @@ import {
   renameFile,
   resolveShareFiles,
   setUserVisibleTags,
+  updateUserTagGrants,
+  updateUserProfiles,
   updateFileDescription,
   updateFileTags,
   verifySharePassword,
   type CreateShareInput,
   type DriveFileMeta,
+  type MergeMode,
   type UserTagGrants,
+  type UserProfiles,
 } from "./storage";
 import { createStoredZipStream } from "./zip";
 
@@ -54,6 +60,7 @@ interface AuthUser {
 interface AuthSession {
   name: string;
   role: UserRole;
+  baseRole: UserRole;
   configured: boolean;
 }
 
@@ -368,6 +375,10 @@ function parseAuthUsers(value: string | undefined) {
   return users;
 }
 
+function authUsers(env: Bindings) {
+  return parseAuthUsers(env.AUTH_USERS);
+}
+
 function timingSafeEqual(a: string, b: string) {
   const encoder = new TextEncoder();
   const left = encoder.encode(a);
@@ -391,11 +402,11 @@ function unauthorizedResponse() {
   });
 }
 
-function authenticate(request: Request, env: Bindings): AuthSession | null {
-  const users = parseAuthUsers(env.AUTH_USERS);
+async function authenticate(request: Request, env: Bindings): Promise<AuthSession | null> {
+  const users = authUsers(env);
   if (!users.length) {
     if (!truthyEnv(env.ALLOW_UNCONFIGURED_AUTH) && !isLocalRequest(request)) return null;
-    return { name: "admin", role: "admin", configured: false };
+    return { name: "admin", role: "admin", baseRole: "admin", configured: false };
   }
 
   const header = request.headers.get("Authorization") || "";
@@ -416,7 +427,9 @@ function authenticate(request: Request, env: Bindings): AuthSession | null {
   const user = users.find((item) => item.name === name);
   if (!user || !timingSafeEqual(user.password, password)) return null;
 
-  return { name: user.name, role: user.role, configured: true };
+  const profiles = await getUserProfiles(createObjectStorage(env)).catch(() => ({} as UserProfiles));
+  const role = profiles[user.name]?.role || user.role;
+  return { name: user.name, role, baseRole: user.role, configured: true };
 }
 
 function isLocalRequest(request: Request) {
@@ -448,9 +461,13 @@ async function visibleFiles(storage: ObjectStorage, session: AuthSession) {
   if (session.role === "admin") return files;
 
   const grants = await getUserTagGrants(storage);
+  const profiles = await getUserProfiles(storage);
   const visibleTags = grants[session.name] || [];
+  const visibleFileIds = new Set(profiles[session.name]?.visibleFileIds || []);
 
-  return files.filter((file) => file.owner === session.name || fileMatchesVisibleTags(file, visibleTags));
+  return files.filter(
+    (file) => file.owner === session.name || visibleFileIds.has(file.id) || fileMatchesVisibleTags(file, visibleTags),
+  );
 }
 
 function fileExtension(name: string) {
@@ -484,9 +501,13 @@ function filterFiles(files: DriveFileMeta[], search: string | undefined, tag: st
 }
 
 function userNamesFromEnv(env: Bindings) {
-  return parseAuthUsers(env.AUTH_USERS)
+  return authUsers(env)
     .filter((user) => user.role !== "admin")
     .map((user) => user.name);
+}
+
+function allUserNamesFromEnv(env: Bindings) {
+  return authUsers(env).map((user) => user.name);
 }
 
 function knownTags(files: DriveFileMeta[], grants: UserTagGrants) {
@@ -510,6 +531,29 @@ function knownTags(files: DriveFileMeta[], grants: UserTagGrants) {
 function fileForClient(file: DriveFileMeta) {
   const { owner: _owner, ...publicFile } = file;
   return publicFile;
+}
+
+function fileForAdmin(file: DriveFileMeta) {
+  return file;
+}
+
+function userSummary(user: AuthUser, profiles: UserProfiles, files: DriveFileMeta[], grants: UserTagGrants) {
+  const profile = profiles[user.name] || null;
+  const ownedCount = files.filter((file) => file.owner === user.name).length;
+  const effectiveRole = profile?.role || user.role;
+
+  return {
+    name: user.name,
+    baseRole: user.role,
+    role: effectiveRole,
+    tags: profile?.tags || [],
+    visibleTags: grants[user.name] || [],
+    visibleFileIds: profile?.visibleFileIds || [],
+    notificationCount: profile?.notifications.length || 0,
+    unreadNotificationCount: profile?.notifications.filter((notification) => !notification.readAt).length || 0,
+    ownedCount,
+    updatedAt: profile?.updatedAt || null,
+  };
 }
 
 async function zipResponse(storage: ObjectStorage, files: DriveFileMeta[], archiveName: string) {
@@ -631,7 +675,7 @@ app.use("/api/*", async (c, next) => {
   if (!consumeRateLimit(`auth:${clientKey}`, authRateLimit(c.env))) {
     return rateLimitResponse();
   }
-  const session = authenticate(c.req.raw, c.env);
+  const session = await authenticate(c.req.raw, c.env);
   if (!session) return unauthorizedResponse();
   c.set("session", session);
 
@@ -648,10 +692,21 @@ app.get("/", async (c) => {
   if (!consumeRateLimit(`auth:${requestClientKey(c.req.raw)}`, authRateLimit(c.env))) {
     return rateLimitResponse();
   }
-  const session = authenticate(c.req.raw, c.env);
+  const session = await authenticate(c.req.raw, c.env);
   if (!session) return unauthorizedResponse();
   c.set("csrfToken", await csrfTokenForSession(c.env, session));
   return c.render(<DriveApp storageName={storageLabel(c.env)} session={session} nonce={c.get("nonce")} />);
+});
+
+app.get("/admin", async (c) => {
+  if (!consumeRateLimit(`auth:${requestClientKey(c.req.raw)}`, authRateLimit(c.env))) {
+    return rateLimitResponse();
+  }
+  const session = await authenticate(c.req.raw, c.env);
+  if (!session) return unauthorizedResponse();
+  if (session.role !== "admin") return errorResponse("需要管理员权限", 403);
+  c.set("csrfToken", await csrfTokenForSession(c.env, session));
+  return c.render(<AdminApp nonce={c.get("nonce")} />);
 });
 
 app.get("/s/:code", (c) => {
@@ -663,6 +718,34 @@ app.get("/api/files", async (c) => {
   const storage = createObjectStorage(c.env);
   const files = filterFiles(await visibleFiles(storage, c.get("session")), c.req.query("q"), c.req.query("tag"));
   return c.json({ files: files.map(fileForClient) });
+});
+
+app.get("/api/notifications", async (c) => {
+  try {
+    const storage = createObjectStorage(c.env);
+    const profiles = await getUserProfiles(storage);
+    const profile = profiles[c.get("session").name];
+    return c.json({ notifications: profile?.notifications.slice().reverse() || [] });
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
+
+app.patch("/api/notifications/read", async (c) => {
+  try {
+    const body = await jsonBody<{ ids?: unknown }>(c.req.raw, maxJsonBytes(c.env));
+    const storage = createObjectStorage(c.env);
+    const notifications = await markUserNotificationsRead(
+      storage,
+      c.get("session").name,
+      Array.isArray(body.ids) ? body.ids.filter((id): id is string => typeof id === "string") : undefined,
+    );
+    return c.json({ notifications: notifications.slice().reverse() });
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
 });
 
 app.post("/api/files", async (c) => {
@@ -971,6 +1054,104 @@ app.patch("/api/admin/permissions/:user", async (c) => {
   }
 });
 
+app.get("/api/admin/overview", async (c) => {
+  try {
+    requireAdmin(c.get("session"));
+    const storage = createObjectStorage(c.env);
+    const files = await listFiles(storage);
+    const grants = await getUserTagGrants(storage);
+    const profiles = await getUserProfiles(storage);
+    const users = authUsers(c.env);
+
+    return c.json({
+      users: users.map((user) => userSummary(user, profiles, files, grants)),
+      files: files.map(fileForAdmin),
+      grants,
+      tags: knownTags(files, grants),
+    });
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
+
+app.post("/api/admin/users/batch", async (c) => {
+  try {
+    requireAdmin(c.get("session"));
+    const body = await jsonBody<{
+      users?: unknown;
+      role?: unknown;
+      tags?: unknown;
+      tagMode?: unknown;
+      visibleTags?: unknown;
+      visibleTagMode?: unknown;
+      visibleFileIds?: unknown;
+      visibleFileMode?: unknown;
+      notification?: unknown;
+    }>(c.req.raw, maxJsonBytes(c.env));
+
+    const storage = createObjectStorage(c.env);
+    const allowedUsers = allUserNamesFromEnv(c.env);
+    const users = Array.isArray(body.users) ? body.users.filter((user): user is string => typeof user === "string") : [];
+    const role: UserRole | null | undefined =
+      body.role === "admin" || body.role === "user" || body.role === null ? body.role : undefined;
+    const tagMode: MergeMode =
+      body.tagMode === "add" || body.tagMode === "remove" || body.tagMode === "replace" ? body.tagMode : "replace";
+    const visibleFileMode: MergeMode =
+      body.visibleFileMode === "add" || body.visibleFileMode === "remove" || body.visibleFileMode === "replace"
+        ? body.visibleFileMode
+        : "replace";
+    const visibleTagMode: MergeMode =
+      body.visibleTagMode === "add" || body.visibleTagMode === "remove" || body.visibleTagMode === "replace"
+        ? body.visibleTagMode
+        : "replace";
+    const shouldUpdateProfiles =
+      role !== undefined ||
+      body.tags !== undefined ||
+      body.visibleFileIds !== undefined ||
+      (body.notification !== undefined && body.notification !== null);
+    const profileInput = {
+      users,
+      role,
+      ...(body.tags !== undefined ? { tags: cleanTags(body.tags) } : {}),
+      tagMode,
+      ...(body.visibleFileIds !== undefined
+        ? {
+            visibleFileIds: Array.isArray(body.visibleFileIds)
+              ? body.visibleFileIds.filter((id): id is string => typeof id === "string" && isUuid(id))
+              : [],
+          }
+        : {}),
+      visibleFileMode,
+      notification:
+        body.notification && typeof body.notification === "object"
+          ? { ...(body.notification as object), from: c.get("session").name }
+          : null,
+      allowedUsers,
+    };
+    const profiles = shouldUpdateProfiles ? await updateUserProfiles(storage, profileInput) : await getUserProfiles(storage);
+
+    const grants =
+      body.visibleTags !== undefined
+        ? await updateUserTagGrants(storage, {
+            users,
+            tags: cleanTags(body.visibleTags),
+            mode: visibleTagMode,
+            allowedUsers,
+          })
+        : await getUserTagGrants(storage);
+
+    const files = await listFiles(storage);
+    return c.json({
+      users: authUsers(c.env).map((user) => userSummary(user, profiles, files, grants)),
+      grants,
+    });
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
+
 function DriveApp({ storageName, session, nonce }: { storageName: string; session: AuthSession; nonce: string }) {
   return (
     <main
@@ -992,6 +1173,10 @@ function DriveApp({ storageName, session, nonce }: { storageName: string; sessio
           <button class="nav-item active" type="button" data-view="files">
             <span>云端文件</span>
           </button>
+          <button class="nav-item" type="button" data-action="notifications">
+            <span>通知</span>
+            <small id="notification-count"></small>
+          </button>
           <button class="nav-item" type="button" data-action="refresh">
             <span>刷新列表</span>
           </button>
@@ -999,9 +1184,9 @@ function DriveApp({ storageName, session, nonce }: { storageName: string; sessio
             <span>粘贴</span>
           </button>
           {session.role === "admin" ? (
-            <button class="nav-item" type="button" data-action="manage-permissions">
+            <a class="nav-item nav-link" href="/admin">
               <span>权限管理</span>
-            </button>
+            </a>
           ) : null}
         </nav>
         <div class="storage-card">
@@ -1060,6 +1245,20 @@ function DriveApp({ storageName, session, nonce }: { storageName: string; sessio
         <button type="button" data-menu-action="cut">剪切</button>
         <button type="button" data-menu-action="share">分享</button>
       </div>
+
+      <dialog id="notification-dialog" class="modal notification-modal">
+        <form method="dialog" class="modal-panel">
+          <header>
+            <h2>通知</h2>
+            <button value="cancel" aria-label="关闭">×</button>
+          </header>
+          <div id="notification-list" class="notification-list"></div>
+          <footer>
+            <span id="notification-status">暂无通知</span>
+            <button id="mark-notifications-read" value="default" type="button">全部标为已读</button>
+          </footer>
+        </form>
+      </dialog>
 
       <dialog id="upload-dialog" class="modal upload-modal">
         <form method="dialog" class="modal-panel" id="upload-form">
@@ -1155,6 +1354,134 @@ function DriveApp({ storageName, session, nonce }: { storageName: string; sessio
       </dialog>
 
       <script nonce={nonce} dangerouslySetInnerHTML={{ __html: clientScript }} />
+    </main>
+  );
+}
+
+function AdminApp({ nonce }: { nonce: string }) {
+  return (
+    <main class="admin-shell" data-app="admin">
+      <aside class="side-rail">
+        <a class="brand" href="/" aria-label="Cirrus Drive">
+          <span class="brand-mark">C</span>
+          <span>
+            <strong>Cirrus</strong>
+            <small>Admin</small>
+          </span>
+        </a>
+        <nav class="nav-stack" aria-label="管理导航">
+          <a class="nav-item nav-link" href="/">
+            <span>返回文件</span>
+          </a>
+          <button class="nav-item" type="button" data-action="admin-refresh">
+            <span>刷新管理数据</span>
+          </button>
+        </nav>
+        <div class="storage-card">
+          <span>Admin Console</span>
+          <strong id="admin-count">0 个用户</strong>
+        </div>
+      </aside>
+
+      <section class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Administration</p>
+            <h1>用户管理</h1>
+          </div>
+        </header>
+
+        <div class="admin-layout">
+          <section class="file-surface admin-panel" aria-label="用户列表">
+            <div class="table-head user-head" aria-hidden="true">
+              <span>用户</span>
+              <span>角色</span>
+              <span>用户标签</span>
+              <span>可见标签</span>
+              <span>可见文件</span>
+              <span>通知</span>
+            </div>
+            <div id="admin-user-list" class="file-list"></div>
+          </section>
+
+          <form id="admin-batch-form" class="modal-panel admin-tools">
+            <h2>批量控制</h2>
+            <label>
+              <span>角色</span>
+              <select id="admin-role">
+                <option value="">不修改</option>
+                <option value="user">普通用户</option>
+                <option value="admin">管理员</option>
+                <option value="clear">恢复配置角色</option>
+              </select>
+            </label>
+            <label>
+              <span>用户标签</span>
+              <input id="admin-user-tags" placeholder="多个标签用逗号分隔" autocomplete="off" />
+            </label>
+            <div class="tag-suggestions" id="admin-user-known-tags"></div>
+            <label>
+              <span>标签模式</span>
+              <select id="admin-tag-mode">
+                <option value="replace">替换</option>
+                <option value="add">追加</option>
+                <option value="remove">移除</option>
+              </select>
+            </label>
+            <label class="inline-check">
+              <input id="admin-clear-user-tags" type="checkbox" />
+              <span>清空用户标签</span>
+            </label>
+            <label>
+              <span>可见标签</span>
+              <input id="admin-visible-tags" placeholder="用户可见的文件标签" autocomplete="off" />
+            </label>
+            <div class="tag-suggestions" id="admin-visible-known-tags"></div>
+            <label>
+              <span>可见标签模式</span>
+              <select id="admin-visible-tag-mode">
+                <option value="replace">替换</option>
+                <option value="add">追加</option>
+                <option value="remove">移除</option>
+              </select>
+            </label>
+            <label class="inline-check">
+              <input id="admin-clear-visible-tags" type="checkbox" />
+              <span>清空可见标签</span>
+            </label>
+            <label>
+              <span>可见文件</span>
+              <select id="admin-visible-files" multiple size={8}></select>
+            </label>
+            <label>
+              <span>文件模式</span>
+              <select id="admin-file-mode">
+                <option value="replace">替换</option>
+                <option value="add">追加</option>
+                <option value="remove">移除</option>
+              </select>
+            </label>
+            <label class="inline-check">
+              <input id="admin-clear-visible-files" type="checkbox" />
+              <span>清空指定可见文件</span>
+            </label>
+            <label>
+              <span>通知标题</span>
+              <input id="admin-notice-title" placeholder="留空则不发送通知" autocomplete="off" />
+            </label>
+            <label>
+              <span>通知内容</span>
+              <textarea id="admin-notice-message" rows={4} placeholder="发送给所选用户"></textarea>
+            </label>
+            <footer>
+              <span id="admin-status">请选择用户</span>
+              <button id="admin-apply-button">应用到所选用户</button>
+            </footer>
+          </form>
+        </div>
+      </section>
+
+      <script nonce={nonce} dangerouslySetInnerHTML={{ __html: adminClientScript }} />
     </main>
   );
 }
@@ -1360,6 +1687,17 @@ textarea {
   text-align: left;
 }
 
+.nav-link {
+  display: inline-flex;
+  min-height: 38px;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: inherit;
+  background: var(--glass-strong);
+  text-decoration: none;
+}
+
 .nav-item.active {
   color: white;
   border-color: transparent;
@@ -1392,7 +1730,8 @@ textarea {
 .table-head,
 #selection-summary,
 #share-status,
-#share-expiry-note {
+#share-expiry-note,
+#notification-count {
   color: var(--muted);
   font-size: 0.86rem;
 }
@@ -1682,6 +2021,18 @@ button.tag-chip {
   color: var(--muted);
 }
 
+.modal-panel .inline-check {
+  display: flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 8px;
+}
+
+.inline-check input {
+  width: auto;
+  min-height: auto;
+}
+
 .modal-panel input {
   width: 100%;
 }
@@ -1765,6 +2116,55 @@ button.tag-chip {
   width: min(560px, calc(100vw - 28px));
 }
 
+.notification-modal {
+  width: min(620px, calc(100vw - 28px));
+}
+
+.notification-list {
+  display: grid;
+  max-height: min(54vh, 420px);
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.notification-item {
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--line), transparent 35%);
+}
+
+.notification-item:last-child {
+  border-bottom: 0;
+}
+
+.notification-item.unread {
+  background: color-mix(in srgb, var(--accent), transparent 90%);
+}
+
+.notification-item header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.notification-item strong,
+.notification-item span {
+  min-width: 0;
+}
+
+.notification-item p {
+  margin: 0;
+  color: var(--muted);
+  word-break: break-word;
+}
+
+.notification-item small {
+  color: var(--muted);
+}
+
 .tag-suggestions {
   padding: 10px;
   border: 1px solid var(--line);
@@ -1808,8 +2208,72 @@ button.tag-chip {
   border-radius: var(--radius);
 }
 
+.admin-shell {
+  display: grid;
+  min-height: 100vh;
+  grid-template-columns: 252px minmax(0, 1fr);
+}
+
+.admin-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 380px);
+  gap: 16px;
+  align-items: start;
+}
+
+.admin-panel {
+  min-height: 620px;
+}
+
+.user-head,
+.user-row {
+  grid-template-columns: minmax(150px, 0.9fr) 110px minmax(150px, 0.75fr) minmax(150px, 0.75fr) 112px 112px;
+}
+
+.user-row {
+  display: grid;
+  align-items: center;
+  gap: 12px;
+  min-height: 64px;
+  padding: 10px 18px;
+  border-bottom: 1px solid color-mix(in srgb, var(--line), transparent 35%);
+}
+
+.user-cell {
+  min-width: 0;
+}
+
+.user-cell strong,
+.user-cell small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-tools {
+  position: sticky;
+  top: 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--glass);
+  padding: 14px;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(24px) saturate(1.35);
+}
+
+.admin-tools footer {
+  align-items: center;
+}
+
+.admin-tools footer span {
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+
 @media (max-width: 860px) {
-  .app-shell {
+  .app-shell,
+  .admin-shell {
     display: block;
   }
 
@@ -1886,6 +2350,22 @@ button.tag-chip {
     grid-area: count;
     text-align: right;
   }
+
+  .admin-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-tools {
+    position: static;
+  }
+
+  .user-head {
+    display: none;
+  }
+
+  .user-row {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 560px) {
@@ -1958,6 +2438,12 @@ const clientScript = String.raw`
   const applyBulkTags = document.getElementById("apply-bulk-tags");
   const uploadFileList = document.getElementById("upload-file-list");
   const confirmUploadButton = document.getElementById("confirm-upload-button");
+  const notificationButton = document.querySelector('[data-action="notifications"]');
+  const notificationCount = document.getElementById("notification-count");
+  const notificationDialog = document.getElementById("notification-dialog");
+  const notificationList = document.getElementById("notification-list");
+  const notificationStatus = document.getElementById("notification-status");
+  const markNotificationsRead = document.getElementById("mark-notifications-read");
   const shareDialog = document.getElementById("share-dialog");
   const shareForm = document.getElementById("share-form");
   const permissionDialog = document.getElementById("permission-dialog");
@@ -1969,6 +2455,7 @@ const clientScript = String.raw`
   let pendingUploads = [];
   let permissions = { users: [], grants: {}, tags: [] };
   let selectedPermissionUser = "";
+  let notifications = [];
 
   const buttons = {
     download: document.querySelector('[data-action="download-selected"]'),
@@ -2233,6 +2720,58 @@ const clientScript = String.raw`
     confirmUploadButton.disabled = pendingUploads.length === 0;
     applyBulkDescription.disabled = pendingUploads.length === 0;
     applyBulkTags.disabled = pendingUploads.length === 0;
+  }
+
+  function renderNotifications() {
+    notificationList.innerHTML = "";
+    if (!notifications.length) {
+      const empty = document.createElement("span");
+      empty.className = "tag-empty";
+      empty.textContent = "暂无通知";
+      notificationList.append(empty);
+    }
+
+    let unread = 0;
+    for (const notification of notifications) {
+      if (!notification.readAt) unread += 1;
+      const item = document.createElement("article");
+      item.className = "notification-item" + (notification.readAt ? "" : " unread");
+      item.innerHTML =
+        '<header>' +
+          '<strong></strong>' +
+          '<small></small>' +
+        '</header>' +
+        '<p></p>' +
+        '<small class="notification-from"></small>';
+      item.querySelector("strong").textContent = notification.title || "通知";
+      item.querySelector("small").textContent = formatDate(notification.createdAt);
+      item.querySelector("p").textContent = notification.message || "";
+      item.querySelector(".notification-from").textContent = "来自 " + (notification.from || "admin");
+      notificationList.append(item);
+    }
+
+    notificationCount.textContent = unread ? unread + " 条未读" : "";
+    notificationStatus.textContent = notifications.length ? notifications.length + " 条通知" : "暂无通知";
+    markNotificationsRead.disabled = unread === 0;
+  }
+
+  async function loadNotifications() {
+    const data = await api("/api/notifications");
+    notifications = data.notifications || [];
+    renderNotifications();
+  }
+
+  async function openNotificationDialog() {
+    await loadNotifications();
+    notificationDialog.showModal();
+  }
+
+  async function markAllNotificationsRead() {
+    await api("/api/notifications/read", {
+      method: "PATCH",
+      body: JSON.stringify({})
+    });
+    await loadNotifications();
   }
 
   function resetUploadDialog() {
@@ -2591,6 +3130,10 @@ const clientScript = String.raw`
     document.getElementById("custom-expiry").hidden = event.target.value !== "custom";
   });
   document.querySelector('[data-action="open-upload"]').addEventListener("click", openUploadDialog);
+  notificationButton.addEventListener("click", () => openNotificationDialog().catch((error) => notify(error.message, "error")));
+  markNotificationsRead.addEventListener("click", () => markAllNotificationsRead().catch((error) => {
+    notificationStatus.textContent = error.message;
+  }));
   fileInput.addEventListener("change", updatePendingFiles);
   applyBulkDescription.addEventListener("click", applyBulkDescriptionToFiles);
   applyBulkTags.addEventListener("click", applyBulkTagsToFiles);
@@ -2626,6 +3169,264 @@ const clientScript = String.raw`
   });
 
   loadFiles().catch((error) => notify(error.message, "error"));
+  loadNotifications().catch(() => {});
+})();
+`;
+
+const adminClientScript = String.raw`
+(() => {
+  const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || "";
+  const state = {
+    users: [],
+    files: [],
+    selected: new Set(),
+    tags: []
+  };
+
+  const userList = document.getElementById("admin-user-list");
+  const count = document.getElementById("admin-count");
+  const status = document.getElementById("admin-status");
+  const form = document.getElementById("admin-batch-form");
+  const roleInput = document.getElementById("admin-role");
+  const tagInput = document.getElementById("admin-user-tags");
+  const tagModeInput = document.getElementById("admin-tag-mode");
+  const clearUserTagsInput = document.getElementById("admin-clear-user-tags");
+  const visibleTagInput = document.getElementById("admin-visible-tags");
+  const visibleTagModeInput = document.getElementById("admin-visible-tag-mode");
+  const clearVisibleTagsInput = document.getElementById("admin-clear-visible-tags");
+  const fileInput = document.getElementById("admin-visible-files");
+  const fileModeInput = document.getElementById("admin-file-mode");
+  const clearVisibleFilesInput = document.getElementById("admin-clear-visible-files");
+  const noticeTitle = document.getElementById("admin-notice-title");
+  const noticeMessage = document.getElementById("admin-notice-message");
+  const userKnownTags = document.getElementById("admin-user-known-tags");
+  const visibleKnownTags = document.getElementById("admin-visible-known-tags");
+
+  async function api(path, options = {}) {
+    const method = (options.method || "GET").toUpperCase();
+    const response = await fetch(path, {
+      ...options,
+      headers: {
+        ...(options.body ? { "Content-Type": "application/json" } : {}),
+        ...(method === "GET" ? {} : { "X-CSRF-Token": csrfToken }),
+        ...(options.headers || {})
+      }
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "请求失败");
+    return data;
+  }
+
+  function parseTags(value) {
+    const seen = new Set();
+    const tags = [];
+    for (const raw of String(value || "").split(/[,，\\n]+/)) {
+      const tag = raw.replace(/[\\u0000-\\u001f\\u007f]+/g, " ").replace(/\\s+/g, " ").trim().slice(0, 32);
+      const key = tag.toLocaleLowerCase();
+      if (!tag || seen.has(key)) continue;
+      seen.add(key);
+      tags.push(tag);
+      if (tags.length >= 20) break;
+    }
+    return tags;
+  }
+
+  function tagsToText(tags) {
+    return (tags || []).join(", ");
+  }
+
+  function renderTags(container, tags) {
+    container.innerHTML = "";
+    if (!tags?.length) {
+      const empty = document.createElement("span");
+      empty.className = "tag-empty";
+      empty.textContent = "无标签";
+      container.append(empty);
+      return;
+    }
+    for (const tag of tags) {
+      const chip = document.createElement("span");
+      chip.className = "tag-chip";
+      chip.textContent = tag;
+      container.append(chip);
+    }
+  }
+
+  function renderFiles() {
+    fileInput.innerHTML = "";
+    for (const file of state.files) {
+      const option = document.createElement("option");
+      option.value = file.id;
+      option.textContent = file.name + (file.owner ? " · " + file.owner : "");
+      fileInput.append(option);
+    }
+  }
+
+  function renderKnownTags() {
+    userKnownTags.innerHTML = "";
+    visibleKnownTags.innerHTML = "";
+    if (!state.tags.length) {
+      const empty = document.createElement("span");
+      empty.className = "tag-empty";
+      empty.textContent = "暂无文件标签";
+      userKnownTags.append(empty.cloneNode(true));
+      visibleKnownTags.append(empty);
+      return;
+    }
+
+    for (const tag of state.tags) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "tag-chip";
+      chip.textContent = tag;
+      chip.addEventListener("click", () => {
+        const next = parseTags(tagInput.value);
+        if (!next.some((item) => item.toLocaleLowerCase() === tag.toLocaleLowerCase())) {
+          next.push(tag);
+        }
+        tagInput.value = tagsToText(next);
+      });
+      userKnownTags.append(chip);
+
+      const visibleChip = document.createElement("button");
+      visibleChip.type = "button";
+      visibleChip.className = "tag-chip";
+      visibleChip.textContent = tag;
+      visibleChip.addEventListener("click", () => {
+        const next = parseTags(visibleTagInput.value);
+        if (!next.some((item) => item.toLocaleLowerCase() === tag.toLocaleLowerCase())) {
+          next.push(tag);
+        }
+        visibleTagInput.value = tagsToText(next);
+      });
+      visibleKnownTags.append(visibleChip);
+    }
+  }
+
+  function updateStatus() {
+    const selectedCount = state.selected.size;
+    status.textContent = selectedCount ? "已选择 " + selectedCount + " 个用户" : "请选择用户";
+    count.textContent = state.users.length + " 个用户";
+  }
+
+  function renderUsers() {
+    userList.innerHTML = "";
+    for (const user of state.users) {
+      const row = document.createElement("label");
+      row.className = "user-row";
+      row.innerHTML =
+        '<span class="user-cell">' +
+          '<strong></strong>' +
+          '<small></small>' +
+        '</span>' +
+        '<span class="user-cell role-cell"></span>' +
+        '<span class="user-cell user-tags"></span>' +
+        '<span class="user-cell visible-tags"></span>' +
+        '<span class="user-cell file-cell"></span>' +
+        '<span class="user-cell notice-cell"></span>';
+
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = state.selected.has(user.name);
+      checkbox.addEventListener("change", () => {
+        if (checkbox.checked) state.selected.add(user.name);
+        else state.selected.delete(user.name);
+        updateStatus();
+      });
+      row.querySelector("strong").before(checkbox);
+      row.querySelector("strong").textContent = user.name;
+      row.querySelector("small").textContent = user.ownedCount + " 个自有文件";
+      row.querySelector(".role-cell").textContent = user.role === "admin" ? "管理员" : "普通用户";
+      renderTags(row.querySelector(".user-tags"), user.tags || []);
+      renderTags(row.querySelector(".visible-tags"), user.visibleTags || []);
+      row.querySelector(".file-cell").textContent = (user.visibleFileIds || []).length + " 个指定文件";
+      row.querySelector(".notice-cell").textContent = (user.unreadNotificationCount || 0) + " 条未读";
+      userList.append(row);
+    }
+    updateStatus();
+  }
+
+  async function load() {
+    status.textContent = "正在读取管理数据...";
+    const data = await api("/api/admin/overview");
+    state.users = data.users || [];
+    state.files = data.files || [];
+    state.tags = data.tags || [];
+    state.selected = new Set(Array.from(state.selected).filter((user) => state.users.some((item) => item.name === user)));
+    renderFiles();
+    renderKnownTags();
+    renderUsers();
+    status.textContent = "管理数据已更新";
+  }
+
+  async function applyBatch(event) {
+    event.preventDefault();
+    const users = Array.from(state.selected);
+    if (!users.length) {
+      status.textContent = "请先选择用户";
+      return;
+    }
+
+    const roleValue = roleInput.value;
+    const selectedFiles = Array.from(fileInput.selectedOptions).map((option) => option.value);
+    const title = noticeTitle.value.trim();
+    const message = noticeMessage.value.trim();
+    const body = {
+      users,
+      tagMode: tagModeInput.value,
+      visibleFileMode: fileModeInput.value
+    };
+
+    if (roleValue) body.role = roleValue === "clear" ? null : roleValue;
+    if (clearUserTagsInput.checked) {
+      body.tags = [];
+      body.tagMode = "replace";
+    } else if (tagInput.value.trim()) {
+      body.tags = parseTags(tagInput.value);
+    }
+    if (clearVisibleTagsInput.checked) {
+      body.visibleTags = [];
+      body.visibleTagMode = "replace";
+    } else if (visibleTagInput.value.trim()) {
+      body.visibleTags = parseTags(visibleTagInput.value);
+      body.visibleTagMode = visibleTagModeInput.value;
+    }
+    if (clearVisibleFilesInput.checked) {
+      body.visibleFileIds = [];
+      body.visibleFileMode = "replace";
+    } else if (selectedFiles.length) {
+      body.visibleFileIds = selectedFiles;
+    }
+    if (title || message) body.notification = { title, message };
+
+    status.textContent = "正在应用批量操作...";
+    const data = await api("/api/admin/users/batch", {
+      method: "POST",
+      body: JSON.stringify(body)
+    });
+    state.users = data.users || [];
+    if (data.grants) {
+      for (const user of state.users) user.visibleTags = data.grants[user.name] || user.visibleTags || [];
+    }
+    noticeTitle.value = "";
+    noticeMessage.value = "";
+    if (clearUserTagsInput.checked) clearUserTagsInput.checked = false;
+    if (clearVisibleTagsInput.checked) clearVisibleTagsInput.checked = false;
+    if (clearVisibleFilesInput.checked) clearVisibleFilesInput.checked = false;
+    renderUsers();
+    status.textContent = "批量操作已完成";
+  }
+
+  document.querySelector('[data-action="admin-refresh"]').addEventListener("click", () => load().catch((error) => {
+    status.textContent = error.message;
+  }));
+  form.addEventListener("submit", (event) => applyBatch(event).catch((error) => {
+    status.textContent = error.message;
+  }));
+
+  load().catch((error) => {
+    status.textContent = error.message;
+  });
 })();
 `;
 
