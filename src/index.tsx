@@ -92,7 +92,7 @@ interface AppVariables {
 const app = new Hono<{ Bindings: Bindings; Variables: AppVariables }>();
 
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
-const DEFAULT_MAX_FILE_BYTES = 100 * 1024 * 1024;
+const DEFAULT_MAX_FILE_BYTES = 250 * 1024 * 1024;
 const DEFAULT_MAX_UPLOAD_BYTES = 250 * 1024 * 1024;
 const DEFAULT_MAX_FILES_PER_UPLOAD = 50;
 const DEFAULT_MAX_JSON_BYTES = 64 * 1024;
@@ -267,6 +267,14 @@ function maxSelectedFiles(env: Bindings) {
 
 function maxShareFiles(env: Bindings) {
   return parsePositiveInt(env.MAX_SHARE_FILES, DEFAULT_MAX_SHARE_FILES, 1000);
+}
+
+function uploadLimits(env: Bindings) {
+  return {
+    maxFileBytes: maxFileBytes(env),
+    maxUploadBytes: maxUploadBytes(env),
+    maxFilesPerUpload: maxFilesPerUpload(env),
+  };
 }
 
 function apiRateLimit(env: Bindings) {
@@ -983,7 +991,9 @@ app.get("/", async (c) => {
   const session = await authenticate(c.req.raw, c.env);
   if (!session) return htmlUnauthorizedResponse(c.get("nonce"), "");
   c.set("csrfToken", await csrfTokenForSession(c.env, session));
-  return c.render(<DriveApp storageName={storageLabel(c.env)} session={session} nonce={c.get("nonce")} />);
+  return c.render(
+    <DriveApp storageName={storageLabel(c.env)} session={session} nonce={c.get("nonce")} limits={uploadLimits(c.env)} />,
+  );
 });
 
 app.get("/admin", async (c) => {
@@ -1687,7 +1697,17 @@ app.post("/api/admin/users/batch", async (c) => {
   }
 });
 
-function DriveApp({ storageName, session, nonce }: { storageName: string; session: AuthSession; nonce: string }) {
+function DriveApp({
+  storageName,
+  session,
+  nonce,
+  limits,
+}: {
+  storageName: string;
+  session: AuthSession;
+  nonce: string;
+  limits: ReturnType<typeof uploadLimits>;
+}) {
   return (
     <main
       class="app-shell"
@@ -1695,6 +1715,9 @@ function DriveApp({ storageName, session, nonce }: { storageName: string; sessio
       data-role={session.role}
       data-user={session.name}
       data-auth-configured={String(session.configured)}
+      data-max-file-bytes={String(limits.maxFileBytes)}
+      data-max-upload-bytes={String(limits.maxUploadBytes)}
+      data-max-files-per-upload={String(limits.maxFilesPerUpload)}
     >
       <aside class="side-rail">
         <a class="brand" href="/" aria-label="Cirrus Drive">
@@ -3226,6 +3249,11 @@ const clientScript = String.raw`
   const SAFE_WRITE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
   const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || "";
   const appRoot = document.querySelector("[data-app='drive']");
+  const uploadLimits = {
+    maxFileBytes: Number(appRoot?.dataset.maxFileBytes || 0),
+    maxUploadBytes: Number(appRoot?.dataset.maxUploadBytes || 0),
+    maxFilesPerUpload: Number(appRoot?.dataset.maxFilesPerUpload || 0)
+  };
   const isAdmin = appRoot?.dataset.role === "admin";
   const list = document.getElementById("file-list");
   const surface = document.getElementById("file-surface");
@@ -3331,7 +3359,7 @@ const clientScript = String.raw`
   }
 
   function setUploadBusy(isBusy) {
-    confirmUploadButton.disabled = isBusy || pendingUploads.length === 0;
+    confirmUploadButton.disabled = isBusy || pendingUploads.length === 0 || Boolean(validatePendingUploads());
     fileInput.disabled = isBusy;
     document.getElementById("retention-select").disabled = isBusy;
     document.getElementById("custom-expiry").disabled = isBusy;
@@ -3355,7 +3383,9 @@ const clientScript = String.raw`
     if (total > 0) {
       const percent = Math.min(100, Math.max(0, Math.round((loaded / total) * 100)));
       uploadProgress.value = percent;
-      uploadProgressText.value = "正在上传 " + percent + "% (" + formatSize(loaded) + " / " + formatSize(total) + ")";
+      uploadProgressText.value = percent >= 100
+        ? "已发送，正在保存到存储..."
+        : "正在上传 " + percent + "% (" + formatSize(loaded) + " / " + formatSize(total) + ")";
       return;
     }
     uploadProgress.removeAttribute("value");
@@ -3377,7 +3407,14 @@ const clientScript = String.raw`
           resolve(xhr.response || {});
           return;
         }
-        const data = xhr.response || {};
+        let data = xhr.response || {};
+        if (typeof data !== "object") {
+          try {
+            data = JSON.parse(xhr.responseText || "{}");
+          } catch {
+            data = {};
+          }
+        }
         reject(new Error(data.error || "上传失败"));
       });
       xhr.addEventListener("error", () => reject(new Error("网络错误，上传失败")));
@@ -3624,7 +3661,7 @@ const clientScript = String.raw`
       });
       uploadFileList.append(row);
     }
-    confirmUploadButton.disabled = pendingUploads.length === 0;
+    confirmUploadButton.disabled = pendingUploads.length === 0 || Boolean(validatePendingUploads());
   }
 
   function renderNotifications() {
@@ -3948,12 +3985,45 @@ const clientScript = String.raw`
       tags: []
     }));
     renderPendingUploads();
+    const validationError = validatePendingUploads();
+    if (validationError) {
+      uploadProgressWrap.hidden = false;
+      uploadProgress.removeAttribute("value");
+      uploadProgressText.value = validationError;
+      notify(validationError, "error");
+    } else {
+      resetUploadProgress();
+    }
+  }
+
+  function validatePendingUploads() {
+    if (!pendingUploads.length) return "";
+    if (uploadLimits.maxFilesPerUpload && pendingUploads.length > uploadLimits.maxFilesPerUpload) {
+      return "一次最多上传 " + uploadLimits.maxFilesPerUpload + " 个文件";
+    }
+    const totalBytes = pendingUploads.reduce((sum, item) => sum + item.file.size, 0);
+    if (uploadLimits.maxUploadBytes && totalBytes > uploadLimits.maxUploadBytes) {
+      return "单次上传总大小不能超过 " + formatSize(uploadLimits.maxUploadBytes);
+    }
+    const oversized = pendingUploads.find((item) => uploadLimits.maxFileBytes && item.file.size > uploadLimits.maxFileBytes);
+    if (oversized) {
+      return "文件 " + oversized.file.name + " 超过单文件上限 " + formatSize(uploadLimits.maxFileBytes);
+    }
+    return "";
   }
 
   async function uploadSelected(event) {
     event.preventDefault();
     const uploads = pendingUploads.slice();
     if (!uploads.length) return;
+    const validationError = validatePendingUploads();
+    if (validationError) {
+      uploadProgressWrap.hidden = false;
+      uploadProgress.removeAttribute("value");
+      uploadProgressText.value = validationError;
+      notify(validationError, "error");
+      return;
+    }
 
     const form = new FormData();
     uploads.forEach((item, index) => {

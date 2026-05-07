@@ -229,7 +229,7 @@ admin:change-me:admin,alice:alice-password:user,bob:bob-password:user
 | 类型 | 名称 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | Secret | `CSRF_SECRET` | 无 | 随机长字符串，用于 CSRF token 派生 |
-| Environment variable | `MAX_FILE_BYTES` | `104857600` | 单文件最大字节数 |
+| Environment variable | `MAX_FILE_BYTES` | `262144000` | 单文件最大字节数 |
 | Environment variable | `MAX_UPLOAD_BYTES` | `262144000` | 单次上传总字节数 |
 | Environment variable | `MAX_FILES_PER_UPLOAD` | `50` | 单次上传文件数量 |
 | Environment variable | `MAX_JSON_BYTES` | `65536` | JSON 请求体最大字节数 |
