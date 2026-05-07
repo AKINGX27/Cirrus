@@ -200,6 +200,18 @@ export async function renameFile(storage: ObjectStorage, id: string, name: strin
   return next;
 }
 
+export async function updateFileDescription(storage: ObjectStorage, id: string, description: string) {
+  const meta = await getActiveFileMeta(storage, id);
+  if (!meta) throw new AppError("文件不存在", 404);
+
+  const next: DriveFileMeta = {
+    ...meta,
+    description: cleanDescription(description),
+  };
+  await saveFileMeta(storage, next);
+  return next;
+}
+
 export async function incrementDownload(storage: ObjectStorage, id: string) {
   const current = await getActiveFileMeta(storage, id);
   if (!current) return null;

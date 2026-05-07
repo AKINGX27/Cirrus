@@ -16,6 +16,7 @@ import {
   parseOptionalDate,
   renameFile,
   resolveShareFiles,
+  updateFileDescription,
   verifySharePassword,
   type CreateShareInput,
   type DriveFileMeta,
@@ -152,7 +153,6 @@ app.post("/api/files", async (c) => {
   try {
     const form = await c.req.formData();
     const expiresAt = parseOptionalDate(form.get("expiresAt"));
-    const description = cleanDescription(form.get("description"));
     const files = (form.getAll("files") as unknown[]).filter(isUploadedFile);
 
     if (!files.length) {
@@ -160,9 +160,27 @@ app.post("/api/files", async (c) => {
     }
 
     const storage = createObjectStorage(c.env);
-    const uploaded = await Promise.all(files.map((file) => createFileFromUpload(storage, file, expiresAt, description)));
+    const fallbackDescription = cleanDescription(form.get("description"));
+    const uploaded = await Promise.all(
+      files.map((file, index) => {
+        const description = cleanDescription(form.get(`description:${index}`)) || fallbackDescription;
+        return createFileFromUpload(storage, file, expiresAt, description);
+      }),
+    );
 
     return c.json({ files: uploaded }, 201);
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
+
+app.patch("/api/files/:id/description", async (c) => {
+  try {
+    const body = await jsonBody<{ description?: unknown }>(c.req.raw);
+    const storage = createObjectStorage(c.env);
+    const file = await updateFileDescription(storage, c.req.param("id"), cleanDescription(body.description));
+    return c.json({ file });
   } catch (error) {
     const { message, status } = jsonError(error);
     return errorResponse(message, status);
@@ -364,21 +382,7 @@ function DriveApp({ storageName }: { storageName: string }) {
             <p class="eyebrow">Personal Cloud</p>
             <h1>文件</h1>
           </div>
-          <form class="upload-card" id="upload-form">
-            <label class="upload-button">
-              <input id="file-input" name="files" type="file" multiple />
-              <span>上传</span>
-            </label>
-            <select id="retention-select" aria-label="存留时间">
-              <option value="">永久保存</option>
-              <option value="1">保留 1 天</option>
-              <option value="7">保留 7 天</option>
-              <option value="30">保留 30 天</option>
-              <option value="custom">自定义</option>
-            </select>
-            <input id="upload-description" name="description" maxLength={500} placeholder="描述" aria-label="文件描述" />
-            <input id="custom-expiry" type="datetime-local" aria-label="自定义存留到期时间" hidden />
-          </form>
+          <button class="upload-button" type="button" data-action="open-upload">上传</button>
         </header>
 
         <div class="command-bar" role="toolbar" aria-label="文件操作">
@@ -410,12 +414,47 @@ function DriveApp({ storageName }: { storageName: string }) {
 
       <div id="context-menu" class="context-menu" hidden>
         <button type="button" data-menu-action="rename">改名</button>
+        <button type="button" data-menu-action="description">修改描述</button>
         <button type="button" data-menu-action="download">下载</button>
         <button type="button" data-menu-action="select">选择</button>
         <button type="button" data-menu-action="copy">复制</button>
         <button type="button" data-menu-action="cut">剪切</button>
         <button type="button" data-menu-action="share">分享</button>
       </div>
+
+      <dialog id="upload-dialog" class="modal upload-modal">
+        <form method="dialog" class="modal-panel" id="upload-form">
+          <header>
+            <h2>上传文件</h2>
+            <button value="cancel" aria-label="关闭">×</button>
+          </header>
+          <label class="file-picker">
+            <span>选择文件</span>
+            <input id="file-input" name="files" type="file" multiple />
+          </label>
+          <label>
+            <span>批量描述</span>
+            <textarea id="bulk-description" maxLength={500} rows={3} placeholder="输入后可应用到全部文件"></textarea>
+          </label>
+          <button type="button" id="apply-bulk-description" disabled>应用到全部</button>
+          <div id="upload-file-list" class="upload-file-list"></div>
+          <label>
+            <span>存留时间</span>
+            <select id="retention-select" aria-label="存留时间">
+              <option value="">永久保存</option>
+              <option value="1">保留 1 天</option>
+              <option value="7">保留 7 天</option>
+              <option value="30">保留 30 天</option>
+              <option value="custom">自定义</option>
+            </select>
+          </label>
+          <input id="custom-expiry" type="datetime-local" aria-label="自定义存留到期时间" hidden />
+          <footer>
+            <button value="cancel">取消</button>
+            <button id="confirm-upload-button" value="default" disabled>确认上传</button>
+          </footer>
+        </form>
+      </dialog>
 
       <dialog id="share-dialog" class="modal">
         <form method="dialog" class="modal-panel" id="share-form">
@@ -534,6 +573,7 @@ body {
 
 button,
 input,
+textarea,
 select {
   font: inherit;
 }
@@ -563,6 +603,7 @@ button:disabled {
 }
 
 input,
+textarea,
 select {
   min-height: 38px;
   border: 1px solid var(--line);
@@ -575,8 +616,15 @@ select {
 }
 
 input:focus,
+textarea:focus,
 select:focus {
   border-color: var(--accent);
+}
+
+textarea {
+  min-height: 84px;
+  padding: 10px 12px;
+  resize: vertical;
 }
 
 .app-shell {
@@ -705,14 +753,6 @@ h2 {
   font-size: 1.2rem;
 }
 
-.upload-card {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: min(100%, 720px);
-  justify-content: flex-end;
-}
-
 .upload-button {
   display: inline-grid;
   min-height: 38px;
@@ -724,14 +764,6 @@ h2 {
   cursor: pointer;
   padding: 0 16px;
   box-shadow: 0 18px 40px rgba(6, 122, 136, 0.18);
-}
-
-.upload-button input {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  opacity: 0;
-  pointer-events: none;
 }
 
 .command-bar {
@@ -938,10 +970,67 @@ h2 {
   width: 100%;
 }
 
+.modal-panel textarea,
+.modal-panel select {
+  width: 100%;
+}
+
 .modal-panel output {
   min-height: 22px;
   color: var(--accent);
   word-break: break-all;
+}
+
+.upload-modal {
+  width: min(720px, calc(100vw - 28px));
+}
+
+.file-picker {
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+  padding: 12px;
+  background: var(--glass);
+}
+
+.upload-file-list {
+  display: grid;
+  max-height: min(38vh, 340px);
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.upload-file-row {
+  display: grid;
+  grid-template-columns: minmax(160px, 0.75fr) minmax(220px, 1fr);
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--line), transparent 35%);
+}
+
+.upload-file-row:last-child {
+  border-bottom: 0;
+}
+
+.upload-file-meta {
+  min-width: 0;
+}
+
+.upload-file-meta strong,
+.upload-file-meta small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.upload-file-meta small {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.upload-file-row textarea {
+  min-height: 74px;
 }
 
 .share-shell {
@@ -1008,14 +1097,9 @@ h2 {
     padding: 16px;
   }
 
-  .topbar,
-  .upload-card {
+  .topbar {
     align-items: stretch;
     flex-direction: column;
-  }
-
-  .upload-card {
-    min-width: 0;
   }
 
   .table-head {
@@ -1085,6 +1169,10 @@ h2 {
   .password-card {
     grid-template-columns: 1fr;
   }
+
+  .upload-file-row {
+    grid-template-columns: 1fr;
+  }
 }
 `;
 
@@ -1104,9 +1192,17 @@ const clientScript = String.raw`
   const menu = document.getElementById("context-menu");
   const summary = document.getElementById("selection-summary");
   const storageCount = document.getElementById("storage-count");
+  const uploadDialog = document.getElementById("upload-dialog");
+  const uploadForm = document.getElementById("upload-form");
+  const fileInput = document.getElementById("file-input");
+  const bulkDescription = document.getElementById("bulk-description");
+  const applyBulkDescription = document.getElementById("apply-bulk-description");
+  const uploadFileList = document.getElementById("upload-file-list");
+  const confirmUploadButton = document.getElementById("confirm-upload-button");
   const shareDialog = document.getElementById("share-dialog");
   const shareForm = document.getElementById("share-form");
   const selectionBox = document.getElementById("selection-box");
+  let pendingUploads = [];
 
   const buttons = {
     download: document.querySelector('[data-action="download-selected"]'),
@@ -1276,23 +1372,78 @@ const clientScript = String.raw`
     return date.toISOString();
   }
 
-  async function uploadSelected() {
-    const input = document.getElementById("file-input");
-    const files = Array.from(input.files || []);
-    if (!files.length) return;
+  function renderPendingUploads() {
+    uploadFileList.innerHTML = "";
+    for (const item of pendingUploads) {
+      const row = document.createElement("div");
+      row.className = "upload-file-row";
+      row.innerHTML =
+        '<span class="upload-file-meta">' +
+          '<strong></strong>' +
+          '<small>' + formatSize(item.file.size) + '</small>' +
+        '</span>' +
+        '<textarea maxlength="500" rows="3" placeholder="该文件的描述"></textarea>';
+      row.querySelector("strong").textContent = item.file.name;
+      const textarea = row.querySelector("textarea");
+      textarea.value = item.description;
+      textarea.addEventListener("input", () => {
+        item.description = textarea.value;
+      });
+      uploadFileList.append(row);
+    }
+    confirmUploadButton.disabled = pendingUploads.length === 0;
+    applyBulkDescription.disabled = pendingUploads.length === 0;
+  }
+
+  function resetUploadDialog() {
+    pendingUploads = [];
+    fileInput.value = "";
+    bulkDescription.value = "";
+    document.getElementById("retention-select").value = "";
+    document.getElementById("custom-expiry").value = "";
+    document.getElementById("custom-expiry").hidden = true;
+    renderPendingUploads();
+  }
+
+  function openUploadDialog() {
+    resetUploadDialog();
+    uploadDialog.showModal();
+  }
+
+  function updatePendingFiles() {
+    pendingUploads = Array.from(fileInput.files || []).map((file) => ({
+      file,
+      description: bulkDescription.value
+    }));
+    renderPendingUploads();
+  }
+
+  function applyBulkDescriptionToFiles() {
+    for (const item of pendingUploads) {
+      item.description = bulkDescription.value;
+    }
+    renderPendingUploads();
+  }
+
+  async function uploadSelected(event) {
+    event.preventDefault();
+    const uploads = pendingUploads.slice();
+    if (!uploads.length) return;
 
     const form = new FormData();
-    for (const file of files) form.append("files", file);
-    form.append("description", document.getElementById("upload-description").value);
+    uploads.forEach((item, index) => {
+      form.append("files", item.file);
+      form.append("description:" + index, item.description);
+    });
     form.append("expiresAt", getExpiryValue());
 
-    notify("正在上传 " + files.length + " 个文件...");
+    notify("正在上传 " + uploads.length + " 个文件...");
     await api("/api/files", {
       method: "POST",
       body: form
     });
-    input.value = "";
-    document.getElementById("upload-description").value = "";
+    uploadDialog.close();
+    resetUploadDialog();
     await loadFiles();
     notify("上传完成");
   }
@@ -1338,6 +1489,18 @@ const clientScript = String.raw`
     await api("/api/files/" + encodeURIComponent(file.id), {
       method: "PATCH",
       body: JSON.stringify({ name })
+    });
+    await loadFiles();
+  }
+
+  async function editDescriptionSelected() {
+    const file = selectedFiles()[0];
+    if (!file || state.selected.size !== 1) return;
+    const description = prompt("输入文件描述", file.description || "");
+    if (description === null || description === (file.description || "")) return;
+    await api("/api/files/" + encodeURIComponent(file.id) + "/description", {
+      method: "PATCH",
+      body: JSON.stringify({ description })
     });
     await loadFiles();
   }
@@ -1473,7 +1636,10 @@ const clientScript = String.raw`
   document.getElementById("retention-select").addEventListener("change", (event) => {
     document.getElementById("custom-expiry").hidden = event.target.value !== "custom";
   });
-  document.getElementById("file-input").addEventListener("change", () => uploadSelected().catch((error) => notify(error.message, "error")));
+  document.querySelector('[data-action="open-upload"]').addEventListener("click", openUploadDialog);
+  fileInput.addEventListener("change", updatePendingFiles);
+  applyBulkDescription.addEventListener("click", applyBulkDescriptionToFiles);
+  uploadForm.addEventListener("submit", (event) => uploadSelected(event).catch((error) => notify(error.message, "error")));
   document.querySelector('[data-action="refresh"]').addEventListener("click", () => loadFiles().catch((error) => notify(error.message, "error")));
   buttons.download.addEventListener("click", () => downloadIds(Array.from(state.selected)).catch((error) => notify(error.message, "error")));
   buttons.share.addEventListener("click", openShareDialog);
@@ -1489,6 +1655,7 @@ const clientScript = String.raw`
     if (!action) return;
     hideMenu();
     if (action === "rename") renameSelected().catch((error) => notify(error.message, "error"));
+    if (action === "description") editDescriptionSelected().catch((error) => notify(error.message, "error"));
     if (action === "download") downloadIds(Array.from(state.selected)).catch((error) => notify(error.message, "error"));
     if (action === "select") render();
     if (action === "copy") setClipboard("copy");
