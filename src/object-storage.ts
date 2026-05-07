@@ -325,7 +325,7 @@ interface DirectMessageRow {
   created_at: string;
 }
 
-const D1_SCHEMA = [
+const D1_TABLE_SCHEMA = [
   `CREATE TABLE IF NOT EXISTS file_meta (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -339,9 +339,6 @@ const D1_SCHEMA = [
     last_downloaded_at TEXT,
     download_count INTEGER NOT NULL DEFAULT 0
   )`,
-  "CREATE INDEX IF NOT EXISTS idx_file_meta_uploaded_at ON file_meta(uploaded_at DESC)",
-  "CREATE INDEX IF NOT EXISTS idx_file_meta_owner ON file_meta(owner)",
-  "CREATE INDEX IF NOT EXISTS idx_file_meta_expires_at ON file_meta(expires_at)",
   `CREATE TABLE IF NOT EXISTS shares (
     code TEXT PRIMARY KEY,
     file_ids TEXT NOT NULL DEFAULT '[]',
@@ -349,7 +346,6 @@ const D1_SCHEMA = [
     created_at TEXT NOT NULL,
     expires_at TEXT
   )`,
-  "CREATE INDEX IF NOT EXISTS idx_shares_expires_at ON shares(expires_at)",
   `CREATE TABLE IF NOT EXISTS user_tag_grants (
     user TEXT PRIMARY KEY,
     tags TEXT NOT NULL DEFAULT '[]',
@@ -367,7 +363,6 @@ const D1_SCHEMA = [
     notifications TEXT NOT NULL DEFAULT '[]',
     updated_at TEXT NOT NULL
   )`,
-  "CREATE INDEX IF NOT EXISTS idx_user_profiles_nickname ON user_profiles(nickname)",
   `CREATE TABLE IF NOT EXISTS user_passwords (
     user TEXT PRIMARY KEY,
     password_hash TEXT NOT NULL,
@@ -382,12 +377,65 @@ const D1_SCHEMA = [
     file_ids TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL
   )`,
-  "CREATE INDEX IF NOT EXISTS idx_direct_messages_conversation ON direct_messages(conversation_id, created_at)",
   `CREATE TABLE IF NOT EXISTS structured_migrations (
     name TEXT PRIMARY KEY,
     completed_at TEXT NOT NULL
   )`,
 ];
+
+const D1_INDEX_SCHEMA = [
+  "CREATE INDEX IF NOT EXISTS idx_file_meta_uploaded_at ON file_meta(uploaded_at DESC)",
+  "CREATE INDEX IF NOT EXISTS idx_file_meta_owner ON file_meta(owner)",
+  "CREATE INDEX IF NOT EXISTS idx_file_meta_expires_at ON file_meta(expires_at)",
+  "CREATE INDEX IF NOT EXISTS idx_shares_expires_at ON shares(expires_at)",
+  "CREATE INDEX IF NOT EXISTS idx_user_profiles_nickname ON user_profiles(nickname)",
+  "CREATE INDEX IF NOT EXISTS idx_direct_messages_conversation ON direct_messages(conversation_id, created_at)",
+];
+
+const D1_COLUMN_SCHEMA = {
+  file_meta: [
+    "name TEXT NOT NULL DEFAULT ''",
+    "description TEXT NOT NULL DEFAULT ''",
+    "tags TEXT NOT NULL DEFAULT '[]'",
+    "owner TEXT NOT NULL DEFAULT ''",
+    "size INTEGER NOT NULL DEFAULT 0",
+    "content_type TEXT NOT NULL DEFAULT 'application/octet-stream'",
+    "uploaded_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z'",
+    "expires_at TEXT",
+    "last_downloaded_at TEXT",
+    "download_count INTEGER NOT NULL DEFAULT 0",
+  ],
+  shares: [
+    "file_ids TEXT NOT NULL DEFAULT '[]'",
+    "password_hash TEXT",
+    "created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z'",
+    "expires_at TEXT",
+  ],
+  user_tag_grants: ["tags TEXT NOT NULL DEFAULT '[]'", "updated_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z'"],
+  user_profiles: [
+    "nickname TEXT NOT NULL DEFAULT ''",
+    "avatar TEXT NOT NULL DEFAULT ''",
+    "status TEXT NOT NULL DEFAULT ''",
+    "role TEXT",
+    "tags TEXT NOT NULL DEFAULT '[]'",
+    "visible_file_ids TEXT NOT NULL DEFAULT '[]'",
+    "friends TEXT NOT NULL DEFAULT '[]'",
+    "notifications TEXT NOT NULL DEFAULT '[]'",
+    "updated_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z'",
+  ],
+  user_passwords: [
+    "password_hash TEXT NOT NULL DEFAULT ''",
+    "updated_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z'",
+  ],
+  direct_messages: [
+    "conversation_id TEXT NOT NULL DEFAULT ''",
+    "from_user TEXT NOT NULL DEFAULT ''",
+    "to_user TEXT NOT NULL DEFAULT ''",
+    "message TEXT NOT NULL DEFAULT ''",
+    "file_ids TEXT NOT NULL DEFAULT '[]'",
+    "created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z'",
+  ],
+} as const;
 
 class D1StructuredStorage implements ObjectStorage {
   private schemaReady?: Promise<void>;
@@ -460,8 +508,25 @@ class D1StructuredStorage implements ObjectStorage {
   }
 
   private async ensureSchema() {
-    this.schemaReady ??= this.db.batch(D1_SCHEMA.map((statement) => this.db.prepare(statement))).then(() => undefined);
+    this.schemaReady ??= this.ensureSchemaReady();
     await this.schemaReady;
+  }
+
+  private async ensureSchemaReady() {
+    await this.db.batch(D1_TABLE_SCHEMA.map((statement) => this.db.prepare(statement)));
+    await this.ensureSchemaColumns();
+    await this.db.batch(D1_INDEX_SCHEMA.map((statement) => this.db.prepare(statement)));
+  }
+
+  private async ensureSchemaColumns() {
+    for (const [table, columns] of Object.entries(D1_COLUMN_SCHEMA)) {
+      const result = await this.db.prepare(`PRAGMA table_info(${table})`).all<{ name: string }>();
+      const existing = new Set((result.results || []).map((column) => column.name));
+      const missing = columns.filter((definition) => !existing.has(definition.split(/\s+/, 1)[0]));
+      if (!missing.length) continue;
+
+      await this.db.batch(missing.map((definition) => this.db.prepare(`ALTER TABLE ${table} ADD COLUMN ${definition}`)));
+    }
   }
 
   private async migrateLegacyObjectJson() {
