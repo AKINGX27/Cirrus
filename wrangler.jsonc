@@ -8,12 +8,6 @@
   "observability": {
     "enabled": true
   },
-  "routes": [
-    {
-      "pattern": "share.medicago.top",
-      "custom_domain": true
-    }
-  ],
   "vars": {
     "STORAGE_BACKEND": "r2"
   },

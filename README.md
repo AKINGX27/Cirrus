@@ -311,6 +311,8 @@ https://cirrus-drive.<你的-workers-子域>.workers.dev
 
 后续只要向生产分支推送代码，Workers Builds 会自动重新部署。
 
+如果要绑定自己的域名，请在 Cloudflare Dashboard 的 Worker `Settings` -> `Triggers` -> `Custom Domains` 中添加，或使用不提交到公开仓库的私有 Wrangler 配置。不要把个人域名写进公开项目的 `wrangler.jsonc` / `wrangler.s3.jsonc`；当前仓库只保留通用的 `workers.dev` 入口。
+
 ### 9. 常见问题
 
 如果构建失败并提示 Worker 名称不匹配，确认 Dashboard 的 `Project name` / `Worker name` 和 `wrangler.jsonc` 的 `name` 都是 `cirrus-drive`。
