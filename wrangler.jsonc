@@ -3,10 +3,17 @@
   "name": "cirrus-drive",
   "main": "src/index.tsx",
   "compatibility_date": "2026-05-03",
+  "workers_dev": true,
   "keep_vars": true,
   "observability": {
     "enabled": true
   },
+  "routes": [
+    {
+      "pattern": "share.medicago.top",
+      "custom_domain": true
+    }
+  ],
   "vars": {
     "STORAGE_BACKEND": "r2"
   },
