@@ -1968,7 +1968,13 @@ function DriveApp({ storageName, session, nonce }: { storageName: string; sessio
             <span>有效期</span>
             <input id="share-expiry" type="datetime-local" />
           </label>
-          <output id="share-output"></output>
+          <label>
+            <span>分享链接</span>
+            <div class="share-link-row">
+              <input id="share-output" readonly aria-label="分享链接" />
+              <button id="copy-share-link-button" type="button" disabled>复制</button>
+            </div>
+          </label>
           <footer>
             <button value="cancel">取消</button>
             <button id="create-share-button" value="default">生成分享</button>
@@ -2971,6 +2977,12 @@ button.tag-chip {
   gap: 8px;
 }
 
+.share-link-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
 .file-list.shared {
   max-height: 54vh;
   border: 1px solid var(--line);
@@ -3253,6 +3265,8 @@ const clientScript = String.raw`
   const sendMessageButton = document.getElementById("send-message-button");
   const shareDialog = document.getElementById("share-dialog");
   const shareForm = document.getElementById("share-form");
+  const shareOutput = document.getElementById("share-output");
+  const copyShareLinkButton = document.getElementById("copy-share-link-button");
   const permissionDialog = document.getElementById("permission-dialog");
   const permissionForm = document.getElementById("permission-form");
   const permissionUser = document.getElementById("permission-user");
@@ -4037,8 +4051,22 @@ const clientScript = String.raw`
     document.getElementById("share-code").value = "";
     document.getElementById("share-password").value = "";
     document.getElementById("share-expiry").value = "";
-    document.getElementById("share-output").value = "";
+    shareOutput.value = "";
+    copyShareLinkButton.disabled = true;
     shareDialog.showModal();
+  }
+
+  async function copyShareLink() {
+    const url = shareOutput.value.trim();
+    if (!url) return;
+    try {
+      await navigator.clipboard?.writeText(url);
+    } catch {
+      shareOutput.focus();
+      shareOutput.select();
+      document.execCommand("copy");
+    }
+    notify("分享链接已复制");
   }
 
   async function createShareFromDialog(event) {
@@ -4055,9 +4083,9 @@ const clientScript = String.raw`
         expiresAt: expiry ? new Date(expiry).toISOString() : ""
       })
     });
-    const output = document.getElementById("share-output");
-    output.value = data.share.url;
-    await navigator.clipboard?.writeText(data.share.url).catch(() => {});
+    shareOutput.value = data.share.url;
+    copyShareLinkButton.disabled = false;
+    await copyShareLink().catch(() => {});
     notify("分享链接已生成");
   }
 
@@ -4248,6 +4276,7 @@ const clientScript = String.raw`
   buttons.rename.addEventListener("click", () => renameSelected().catch((error) => notify(error.message, "error")));
   buttons.delete.addEventListener("click", () => deleteSelected().catch((error) => notify(error.message, "error")));
   buttons.paste.addEventListener("click", () => pasteClipboard().catch((error) => notify(error.message, "error")));
+  copyShareLinkButton.addEventListener("click", () => copyShareLink().catch((error) => notify(error.message, "error")));
   shareForm.addEventListener("submit", (event) => createShareFromDialog(event).catch((error) => notify(error.message, "error")));
 
   menu.addEventListener("click", (event) => {

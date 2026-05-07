@@ -627,6 +627,8 @@ test("registered users, profile settings, permissions, files, sharing, friends, 
     const html = await expectText(htmlResponse, 200, "GET / authenticated");
     assertIncludes(html, 'id="context-menu"');
     assertIncludes(html, 'id="context-menu" class="context-menu" hidden');
+    assertIncludes(html, 'id="share-output" readonly');
+    assertIncludes(html, 'id="copy-share-link-button" type="button" disabled');
     assertIncludes(html, "<span>描述</span>");
     assertIncludes(html, "<span>标签</span>");
     assertIncludes(html, "搜索文件名、标签、描述、扩展名");
