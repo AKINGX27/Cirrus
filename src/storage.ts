@@ -3,8 +3,10 @@ import type { ObjectStorage } from "./object-storage";
 const OBJECT_PREFIX = "objects/";
 const META_PREFIX = "meta/";
 const SHARE_PREFIX = "shares/";
+const DIRECT_MESSAGES_PREFIX = "messages/";
 const PERMISSIONS_KEY = "permissions/tag-grants.json";
 const USER_PROFILES_KEY = "permissions/user-profiles.json";
+const USER_PASSWORDS_KEY = "accounts/passwords.json";
 
 export interface DriveFileMeta {
   id: string;
@@ -61,9 +63,13 @@ export interface UserNotification {
 }
 
 export interface UserProfile {
+  nickname: string;
+  avatar: string;
+  status: string;
   role: ManagedUserRole | null;
   tags: string[];
   visibleFileIds: string[];
+  friends: string[];
   notifications: UserNotification[];
   updatedAt: string;
 }
@@ -82,6 +88,37 @@ export interface UpdateUserProfilesInput {
     message?: string;
     from?: string;
   } | null;
+  allowedUsers?: string[];
+}
+
+export interface UpdateOwnUserProfileInput {
+  nickname?: unknown;
+  avatar?: unknown;
+  status?: unknown;
+  allowedUsers?: string[];
+}
+
+export interface UserPasswordCredential {
+  passwordHash: string;
+  updatedAt: string;
+}
+
+export type UserPasswordCredentials = Record<string, UserPasswordCredential>;
+
+export interface DirectMessage {
+  id: string;
+  from: string;
+  to: string;
+  message: string;
+  fileIds: string[];
+  createdAt: string;
+}
+
+export interface SendDirectMessageInput {
+  from: string;
+  to: string;
+  message?: unknown;
+  fileIds?: unknown;
   allowedUsers?: string[];
 }
 
@@ -106,6 +143,10 @@ function shareKey(code: string) {
   return `${SHARE_PREFIX}${code}.json`;
 }
 
+function directConversationKey(userA: string, userB: string) {
+  return `${DIRECT_MESSAGES_PREFIX}${conversationId(userA, userB)}.json`;
+}
+
 export function cleanFileName(name: string) {
   const cleaned = name
     .replace(/[\/\\]+/g, "_")
@@ -126,6 +167,23 @@ export function cleanDescription(value: unknown) {
 export function cleanText(value: unknown, maxLength = 500) {
   if (typeof value !== "string") return "";
   return value.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, maxLength);
+}
+
+export function cleanNickname(value: unknown) {
+  return cleanText(value, 32);
+}
+
+export function cleanAvatar(value: unknown) {
+  if (typeof value !== "string") return "";
+  const avatar = value.trim();
+  if (!avatar) return "";
+  if (avatar.length > 50_000) return "";
+  if (!/^data:image\/(?:png|jpeg|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(avatar)) return "";
+  return avatar;
+}
+
+export function cleanStatus(value: unknown) {
+  return cleanText(value, 80);
 }
 
 export function cleanTags(value: unknown) {
@@ -181,6 +239,24 @@ function cleanUuidList(value: unknown) {
 
 function isUuid(value: string) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function cleanUserList(value: unknown, allowed?: Set<string>) {
+  const values = Array.isArray(value) ? value : [];
+  const seen = new Set<string>();
+  const users: string[] = [];
+  for (const raw of values) {
+    const user = cleanUserName(raw);
+    if (!user || seen.has(user) || (allowed && !allowed.has(user))) continue;
+    seen.add(user);
+    users.push(user);
+    if (users.length >= 1000) break;
+  }
+  return users;
+}
+
+function conversationId(userA: string, userB: string) {
+  return [cleanUserName(userA), cleanUserName(userB)].sort((a, b) => a.localeCompare(b)).join("__");
 }
 
 export function isExpired(expiresAt: string | null | undefined, now = Date.now()) {
@@ -505,9 +581,13 @@ function normalizeUserProfile(value: unknown): UserProfile {
     : [];
 
   return {
+    nickname: cleanNickname(source.nickname),
+    avatar: cleanAvatar(source.avatar),
+    status: cleanStatus(source.status),
     role: cleanRole(source.role),
     tags: cleanTags(source.tags),
     visibleFileIds: cleanUuidList(source.visibleFileIds),
+    friends: cleanUserList(source.friends),
     notifications: notifications as UserNotification[],
     updatedAt: typeof source.updatedAt === "string" ? source.updatedAt : new Date(0).toISOString(),
   };
@@ -556,6 +636,99 @@ export async function saveUserProfiles(storage: ObjectStorage, profiles: UserPro
   await writeJson(storage, USER_PROFILES_KEY, normalizeUserProfiles(profiles));
 }
 
+function normalizeUserPasswordCredentials(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+
+  const credentials: UserPasswordCredentials = {};
+  for (const [user, credential] of Object.entries(value)) {
+    const normalizedUser = cleanUserName(user);
+    if (!normalizedUser || !credential || typeof credential !== "object" || Array.isArray(credential)) continue;
+    const source = credential as Partial<UserPasswordCredential>;
+    if (typeof source.passwordHash !== "string" || !source.passwordHash.startsWith("pbkdf2-sha256:")) continue;
+    credentials[normalizedUser] = {
+      passwordHash: source.passwordHash,
+      updatedAt: typeof source.updatedAt === "string" ? source.updatedAt : new Date(0).toISOString(),
+    };
+  }
+
+  return credentials;
+}
+
+export async function getUserPasswordCredentials(storage: ObjectStorage) {
+  return normalizeUserPasswordCredentials(await readJson<UserPasswordCredentials>(storage, USER_PASSWORDS_KEY));
+}
+
+export async function saveUserPasswordCredentials(storage: ObjectStorage, credentials: UserPasswordCredentials) {
+  await writeJson(storage, USER_PASSWORDS_KEY, normalizeUserPasswordCredentials(credentials));
+}
+
+function nicknameOwner(profiles: UserProfiles, nickname: string, currentUser: string) {
+  const normalized = nickname.toLocaleLowerCase();
+  if (!normalized) return "";
+  for (const [user, profile] of Object.entries(profiles)) {
+    if (user === currentUser) continue;
+    if (profile.nickname.toLocaleLowerCase() === normalized) return user;
+  }
+  return "";
+}
+
+export async function ensureUserProfiles(storage: ObjectStorage, users: string[]) {
+  const profiles = await getUserProfiles(storage);
+  const now = new Date().toISOString();
+  let changed = false;
+
+  for (const user of users.map(cleanUserName).filter(Boolean)) {
+    if (profiles[user]) continue;
+    profiles[user] = {
+      nickname: "",
+      avatar: "",
+      status: "",
+      role: null,
+      tags: [],
+      visibleFileIds: [],
+      friends: [],
+      notifications: [],
+      updatedAt: now,
+    };
+    changed = true;
+  }
+
+  if (changed) await saveUserProfiles(storage, profiles);
+  return profiles;
+}
+
+export async function updateOwnUserProfile(storage: ObjectStorage, user: string, input: UpdateOwnUserProfileInput) {
+  const normalizedUser = cleanUserName(user);
+  if (!normalizedUser) throw new AppError("用户无效");
+  if (input.allowedUsers && !input.allowedUsers.map(cleanUserName).includes(normalizedUser)) {
+    throw new AppError("只能修改已配置用户", 400);
+  }
+
+  const profiles = await ensureUserProfiles(storage, input.allowedUsers || [normalizedUser]);
+  const current = normalizeUserProfile(profiles[normalizedUser]);
+  const next: UserProfile = { ...current, updatedAt: new Date().toISOString() };
+
+  if (input.nickname !== undefined) {
+    const nickname = cleanNickname(input.nickname);
+    if (!nickname) throw new AppError("请输入昵称");
+    const owner = nicknameOwner(profiles, nickname, normalizedUser);
+    if (owner) throw new AppError("昵称已被使用", 409);
+    next.nickname = nickname;
+  }
+  if (input.avatar !== undefined) {
+    const avatar = cleanAvatar(input.avatar);
+    if (typeof input.avatar === "string" && input.avatar.trim() && !avatar) throw new AppError("头像格式无效");
+    next.avatar = avatar;
+  }
+  if (input.status !== undefined) {
+    next.status = cleanStatus(input.status);
+  }
+
+  profiles[normalizedUser] = next;
+  await saveUserProfiles(storage, profiles);
+  return next;
+}
+
 export async function updateUserProfiles(storage: ObjectStorage, input: UpdateUserProfilesInput) {
   const allowed = input.allowedUsers ? new Set(input.allowedUsers.map(cleanUserName).filter(Boolean)) : null;
   const users = Array.from(new Set(input.users.map(cleanUserName).filter(Boolean)));
@@ -596,6 +769,139 @@ export async function updateUserProfiles(storage: ObjectStorage, input: UpdateUs
 
   await saveUserProfiles(storage, profiles);
   return profiles;
+}
+
+export async function addFriend(storage: ObjectStorage, user: string, friend: string, allowedUsers?: string[]) {
+  const normalizedUser = cleanUserName(user);
+  const normalizedFriend = cleanUserName(friend);
+  if (!normalizedUser || !normalizedFriend) throw new AppError("用户无效");
+  if (normalizedUser === normalizedFriend) throw new AppError("不能添加自己为好友");
+
+  const allowed = allowedUsers ? new Set(allowedUsers.map(cleanUserName).filter(Boolean)) : null;
+  if (allowed && (!allowed.has(normalizedUser) || !allowed.has(normalizedFriend))) {
+    throw new AppError("只能添加已配置用户", 400);
+  }
+
+  const profiles = await ensureUserProfiles(storage, allowedUsers || [normalizedUser, normalizedFriend]);
+  const current = normalizeUserProfile(profiles[normalizedUser]);
+  const target = normalizeUserProfile(profiles[normalizedFriend]);
+  const now = new Date().toISOString();
+
+  current.friends = mergeValues(current.friends, [normalizedFriend], "add");
+  target.friends = mergeValues(target.friends, [normalizedUser], "add");
+  current.updatedAt = now;
+  target.updatedAt = now;
+  profiles[normalizedUser] = current;
+  profiles[normalizedFriend] = target;
+  await saveUserProfiles(storage, profiles);
+  return profiles;
+}
+
+export async function removeFriend(storage: ObjectStorage, user: string, friend: string, allowedUsers?: string[]) {
+  const normalizedUser = cleanUserName(user);
+  const normalizedFriend = cleanUserName(friend);
+  if (!normalizedUser || !normalizedFriend) throw new AppError("用户无效");
+
+  const profiles = await ensureUserProfiles(storage, allowedUsers || [normalizedUser, normalizedFriend]);
+  const current = normalizeUserProfile(profiles[normalizedUser]);
+  const target = normalizeUserProfile(profiles[normalizedFriend]);
+  const now = new Date().toISOString();
+
+  current.friends = mergeValues(current.friends, [normalizedFriend], "remove");
+  target.friends = mergeValues(target.friends, [normalizedUser], "remove");
+  current.updatedAt = now;
+  target.updatedAt = now;
+  profiles[normalizedUser] = current;
+  profiles[normalizedFriend] = target;
+  await saveUserProfiles(storage, profiles);
+  return profiles;
+}
+
+function normalizeDirectMessage(value: unknown): DirectMessage | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const source = value as Partial<DirectMessage>;
+  const from = cleanUserName(source.from);
+  const to = cleanUserName(source.to);
+  const message = cleanText(source.message, 1000);
+  const fileIds = cleanUuidList(source.fileIds).slice(0, 50);
+  if (!from || !to || (!message && !fileIds.length)) return null;
+
+  return {
+    id: typeof source.id === "string" && isUuid(source.id) ? source.id : crypto.randomUUID(),
+    from,
+    to,
+    message,
+    fileIds,
+    createdAt: typeof source.createdAt === "string" ? source.createdAt : new Date().toISOString(),
+  };
+}
+
+function normalizeDirectMessages(value: unknown) {
+  const rawMessages = Array.isArray(value) ? value : [];
+  return rawMessages.map(normalizeDirectMessage).filter(Boolean) as DirectMessage[];
+}
+
+export async function getDirectMessages(storage: ObjectStorage, user: string, friend: string, allowedUsers?: string[]) {
+  const normalizedUser = cleanUserName(user);
+  const normalizedFriend = cleanUserName(friend);
+  if (!normalizedUser || !normalizedFriend) throw new AppError("用户无效");
+
+  const profiles = await ensureUserProfiles(storage, allowedUsers || [normalizedUser, normalizedFriend]);
+  if (!profiles[normalizedUser].friends.includes(normalizedFriend)) {
+    throw new AppError("只能查看好友私信", 403);
+  }
+
+  return normalizeDirectMessages(await readJson<DirectMessage[]>(storage, directConversationKey(normalizedUser, normalizedFriend)));
+}
+
+export async function sendDirectMessage(storage: ObjectStorage, input: SendDirectMessageInput) {
+  const from = cleanUserName(input.from);
+  const to = cleanUserName(input.to);
+  if (!from || !to) throw new AppError("用户无效");
+  if (from === to) throw new AppError("不能给自己发送私信");
+
+  const allowed = input.allowedUsers ? new Set(input.allowedUsers.map(cleanUserName).filter(Boolean)) : null;
+  if (allowed && (!allowed.has(from) || !allowed.has(to))) throw new AppError("只能给已配置用户发送私信", 400);
+
+  const profiles = await ensureUserProfiles(storage, input.allowedUsers || [from, to]);
+  if (!profiles[from].friends.includes(to)) throw new AppError("只能给好友发送私信", 403);
+
+  const message = cleanText(input.message, 1000);
+  const fileIds = cleanUuidList(input.fileIds).slice(0, 50);
+  if (!message && !fileIds.length) throw new AppError("请输入私信内容或选择文件");
+
+  const key = directConversationKey(from, to);
+  const messages = normalizeDirectMessages(await readJson<DirectMessage[]>(storage, key));
+  const now = new Date().toISOString();
+  const next: DirectMessage = {
+    id: crypto.randomUUID(),
+    from,
+    to,
+    message,
+    fileIds,
+    createdAt: now,
+  };
+
+  messages.push(next);
+  await writeJson(storage, key, messages.slice(-500));
+
+  const target = normalizeUserProfile(profiles[to]);
+  target.notifications = [
+    ...target.notifications,
+    {
+      id: crypto.randomUUID(),
+      title: "新的私信",
+      message: fileIds.length ? `${profiles[from]?.nickname || from} 向你发送了文件` : message,
+      from,
+      createdAt: now,
+      readAt: null,
+    },
+  ].slice(-100);
+  target.updatedAt = now;
+  profiles[to] = target;
+  await saveUserProfiles(storage, profiles);
+
+  return next;
 }
 
 export async function markUserNotificationsRead(storage: ObjectStorage, user: string, ids?: string[]) {
@@ -682,6 +988,14 @@ async function hashPassword(code: string, password: string) {
   );
 
   return `pbkdf2-sha256:${iterations}:${base64Url(salt)}:${base64Url(new Uint8Array(bits))}`;
+}
+
+export async function hashUserPassword(user: string, password: string) {
+  const normalizedUser = cleanUserName(user);
+  const normalizedPassword = cleanText(password, 512);
+  if (!normalizedUser) throw new AppError("用户无效");
+  if (normalizedPassword.length < 8) throw new AppError("密码至少需要 8 位");
+  return hashPassword(`user:${normalizedUser}`, normalizedPassword);
 }
 
 function base64Url(bytes: Uint8Array) {
@@ -785,6 +1099,54 @@ export async function verifySharePassword(share: ShareRecord, password: string |
   );
 
   return timingSafeBytesEqual(new Uint8Array(bits), expected);
+}
+
+export async function verifyUserPasswordHash(user: string, passwordHash: string, password: string | null | undefined) {
+  const normalizedUser = cleanUserName(user);
+  if (!normalizedUser || !password || !passwordHash.startsWith("pbkdf2-sha256:")) return false;
+
+  const [, iterationsValue, saltValue, hashValue] = passwordHash.split(":");
+  const iterations = Number(iterationsValue);
+  if (!Number.isSafeInteger(iterations) || iterations < 10_000 || !saltValue || !hashValue) return false;
+
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", encoder.encode(`user:${normalizedUser}:${password}`), "PBKDF2", false, [
+    "deriveBits",
+  ]);
+  const expected = base64UrlToBytes(hashValue);
+  const bits = await crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      hash: "SHA-256",
+      salt: base64UrlToBytes(saltValue),
+      iterations,
+    },
+    key,
+    expected.length * 8,
+  );
+
+  return timingSafeBytesEqual(new Uint8Array(bits), expected);
+}
+
+export async function updateUserPassword(
+  storage: ObjectStorage,
+  user: string,
+  newPassword: string,
+  allowedUsers?: string[],
+) {
+  const normalizedUser = cleanUserName(user);
+  if (!normalizedUser) throw new AppError("用户无效");
+  if (allowedUsers && !allowedUsers.map(cleanUserName).includes(normalizedUser)) {
+    throw new AppError("只能修改已配置用户", 400);
+  }
+
+  const credentials = await getUserPasswordCredentials(storage);
+  credentials[normalizedUser] = {
+    passwordHash: await hashUserPassword(normalizedUser, newPassword),
+    updatedAt: new Date().toISOString(),
+  };
+  await saveUserPasswordCredentials(storage, credentials);
+  return credentials[normalizedUser];
 }
 
 export async function resolveShareFiles(storage: ObjectStorage, share: ShareRecord) {

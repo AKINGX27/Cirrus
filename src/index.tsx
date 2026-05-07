@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { jsxRenderer } from "hono/jsx-renderer";
 import { createObjectStorage, storageLabel, type ObjectStorage, type StorageEnv } from "./object-storage";
 import {
+  addFriend,
   AppError,
   copyFiles,
   createFileFromUpload,
@@ -9,8 +10,11 @@ import {
   deleteDriveFile,
   getActiveFileMeta,
   getShare,
+  getDirectMessages,
+  getUserPasswordCredentials,
   getUserProfiles,
   getUserTagGrants,
+  hashUserPassword,
   incrementDownload,
   listFiles,
   markUserNotificationsRead,
@@ -19,16 +23,23 @@ import {
   cleanTags,
   parseOptionalDate,
   renameFile,
+  removeFriend,
   resolveShareFiles,
+  sendDirectMessage,
   setUserVisibleTags,
+  updateOwnUserProfile,
+  updateUserPassword,
   updateUserTagGrants,
   updateUserProfiles,
   updateFileDescription,
   updateFileTags,
   verifySharePassword,
+  verifyUserPasswordHash,
   type CreateShareInput,
+  type DirectMessage,
   type DriveFileMeta,
   type MergeMode,
+  type UserPasswordCredentials,
   type UserTagGrants,
   type UserProfiles,
 } from "./storage";
@@ -425,9 +436,17 @@ async function authenticate(request: Request, env: Bindings): Promise<AuthSessio
   const name = decoded.slice(0, separator);
   const password = decoded.slice(separator + 1);
   const user = users.find((item) => item.name === name);
-  if (!user || !timingSafeEqual(user.password, password)) return null;
+  if (!user) return null;
 
-  const profiles = await getUserProfiles(createObjectStorage(env)).catch(() => ({} as UserProfiles));
+  const storage = createObjectStorage(env);
+  const credentials = await getUserPasswordCredentials(storage).catch(() => ({} as UserPasswordCredentials));
+  const credential = credentials[user.name];
+  const passwordMatches = credential
+    ? await verifyUserPasswordHash(user.name, credential.passwordHash, password)
+    : timingSafeEqual(user.password, password);
+  if (!passwordMatches) return null;
+
+  const profiles = await getUserProfiles(storage).catch(() => ({} as UserProfiles));
   const role = profiles[user.name]?.role || user.role;
   return { name: user.name, role, baseRole: user.role, configured: true };
 }
@@ -537,6 +556,18 @@ function fileForAdmin(file: DriveFileMeta) {
   return file;
 }
 
+function userProfileForClient(user: AuthUser, profiles: UserProfiles, currentUser: string) {
+  const profile = profiles[user.name] || null;
+  return {
+    name: user.name,
+    nickname: profile?.nickname || "",
+    avatar: profile?.avatar || "",
+    status: profile?.status || "",
+    tags: profile?.tags || [],
+    isFriend: profile?.friends.includes(currentUser) || profiles[currentUser]?.friends.includes(user.name) || false,
+  };
+}
+
 function userSummary(user: AuthUser, profiles: UserProfiles, files: DriveFileMeta[], grants: UserTagGrants) {
   const profile = profiles[user.name] || null;
   const ownedCount = files.filter((file) => file.owner === user.name).length;
@@ -544,15 +575,29 @@ function userSummary(user: AuthUser, profiles: UserProfiles, files: DriveFileMet
 
   return {
     name: user.name,
+    nickname: profile?.nickname || "",
+    avatar: profile?.avatar || "",
+    status: profile?.status || "",
     baseRole: user.role,
     role: effectiveRole,
     tags: profile?.tags || [],
     visibleTags: grants[user.name] || [],
+    friends: profile?.friends || [],
     visibleFileIds: profile?.visibleFileIds || [],
     notificationCount: profile?.notifications.length || 0,
     unreadNotificationCount: profile?.notifications.filter((notification) => !notification.readAt).length || 0,
     ownedCount,
     updatedAt: profile?.updatedAt || null,
+  };
+}
+
+function messageForClient(message: DirectMessage, files: Map<string, DriveFileMeta>) {
+  return {
+    ...message,
+    files: message.fileIds
+      .map((id) => files.get(id))
+      .filter((file): file is DriveFileMeta => Boolean(file))
+      .map(fileForClient),
   };
 }
 
@@ -718,6 +763,194 @@ app.get("/api/files", async (c) => {
   const storage = createObjectStorage(c.env);
   const files = filterFiles(await visibleFiles(storage, c.get("session")), c.req.query("q"), c.req.query("tag"));
   return c.json({ files: files.map(fileForClient) });
+});
+
+app.get("/api/me", async (c) => {
+  try {
+    const storage = createObjectStorage(c.env);
+    const profiles = await getUserProfiles(storage);
+    const session = c.get("session");
+    const user = authUsers(c.env).find((item) => item.name === session.name) || {
+      name: session.name,
+      password: "",
+      role: session.baseRole,
+    };
+
+    return c.json({
+      user: {
+        ...userProfileForClient(user, profiles, session.name),
+        role: session.role,
+        baseRole: session.baseRole,
+        configured: session.configured,
+      },
+    });
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
+
+app.patch("/api/me/profile", async (c) => {
+  try {
+    const body = await jsonBody<{
+      nickname?: unknown;
+      avatar?: unknown;
+      status?: unknown;
+      currentPassword?: unknown;
+      newPassword?: unknown;
+    }>(c.req.raw, maxJsonBytes(c.env));
+    const storage = createObjectStorage(c.env);
+    const allowedUsers = allUserNamesFromEnv(c.env);
+    const profile = await updateOwnUserProfile(storage, c.get("session").name, {
+      nickname: body.nickname,
+      avatar: body.avatar,
+      status: body.status,
+      allowedUsers: allowedUsers.length ? allowedUsers : undefined,
+    });
+
+    let passwordChanged = false;
+    if (body.newPassword !== undefined && String(body.newPassword || "").trim()) {
+      const currentPassword = typeof body.currentPassword === "string" ? body.currentPassword : "";
+      const newPassword = typeof body.newPassword === "string" ? body.newPassword : "";
+      const currentUser = authUsers(c.env).find((user) => user.name === c.get("session").name);
+      if (!currentUser) throw new AppError("用户不存在", 404);
+
+      const credentials = await getUserPasswordCredentials(storage);
+      const credential = credentials[currentUser.name];
+      const verified = credential
+        ? await verifyUserPasswordHash(currentUser.name, credential.passwordHash, currentPassword)
+        : timingSafeEqual(currentUser.password, currentPassword);
+      if (!verified) throw new AppError("当前密码不正确", 403);
+
+      await updateUserPassword(storage, currentUser.name, newPassword, allowedUsers.length ? allowedUsers : undefined);
+      passwordChanged = true;
+    }
+
+    return c.json({ profile, passwordChanged });
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
+
+app.get("/api/users/search", async (c) => {
+  try {
+    const query = (c.req.query("q") || "").trim().toLocaleLowerCase();
+    if (!query) return c.json({ users: [] });
+
+    const storage = createObjectStorage(c.env);
+    const profiles = await getUserProfiles(storage);
+    const currentUser = c.get("session").name;
+    const users = authUsers(c.env)
+      .filter((user) => user.name !== currentUser)
+      .filter((user) => {
+        const profile = profiles[user.name];
+        const haystack = [
+          user.name,
+          profile?.nickname || "",
+          ...(profile?.tags || []),
+        ].join(" ").toLocaleLowerCase();
+        return haystack.includes(query);
+      })
+      .slice(0, 30)
+      .map((user) => userProfileForClient(user, profiles, currentUser));
+
+    return c.json({ users });
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
+
+app.get("/api/friends", async (c) => {
+  try {
+    const storage = createObjectStorage(c.env);
+    const profiles = await getUserProfiles(storage);
+    const users = new Map(authUsers(c.env).map((user) => [user.name, user]));
+    const current = profiles[c.get("session").name];
+    const friends = (current?.friends || [])
+      .map((name) => users.get(name))
+      .filter(Boolean)
+      .map((user) => userProfileForClient(user as AuthUser, profiles, c.get("session").name));
+    return c.json({ friends });
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
+
+app.post("/api/friends/:user", async (c) => {
+  try {
+    const storage = createObjectStorage(c.env);
+    const profiles = await addFriend(storage, c.get("session").name, c.req.param("user"), allUserNamesFromEnv(c.env));
+    const target = authUsers(c.env).find((user) => user.name === c.req.param("user"));
+    if (!target) throw new AppError("用户不存在", 404);
+    return c.json({ friend: userProfileForClient(target, profiles, c.get("session").name) });
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
+
+app.delete("/api/friends/:user", async (c) => {
+  try {
+    const storage = createObjectStorage(c.env);
+    await removeFriend(storage, c.get("session").name, c.req.param("user"), allUserNamesFromEnv(c.env));
+    return c.json({ ok: true });
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
+
+app.get("/api/messages/:user", async (c) => {
+  try {
+    const storage = createObjectStorage(c.env);
+    const messages = await getDirectMessages(storage, c.get("session").name, c.req.param("user"), allUserNamesFromEnv(c.env));
+    const allowedFiles = new Map((await visibleFiles(storage, c.get("session"))).map((file) => [file.id, file]));
+    return c.json({ messages: messages.map((message) => messageForClient(message, allowedFiles)) });
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
+
+app.post("/api/messages/:user", async (c) => {
+  try {
+    const body = await jsonBody<{ message?: unknown; fileIds?: unknown }>(c.req.raw, maxJsonBytes(c.env));
+    const storage = createObjectStorage(c.env);
+    const fileIds = Array.isArray(body.fileIds)
+      ? body.fileIds.filter((id): id is string => typeof id === "string" && isUuid(id))
+      : [];
+    const profiles = await getUserProfiles(storage);
+    const targetUser = c.req.param("user");
+    if (!profiles[c.get("session").name]?.friends.includes(targetUser)) {
+      throw new AppError("只能给好友发送私信", 403);
+    }
+    if (fileIds.length) {
+      const allowed = new Set((await visibleFiles(storage, c.get("session"))).map((file) => file.id));
+      if (fileIds.some((id) => !allowed.has(id))) throw new AppError("无权分享所选文件", 403);
+      await updateUserProfiles(storage, {
+        users: [c.req.param("user")],
+        visibleFileIds: fileIds,
+        visibleFileMode: "add",
+        allowedUsers: allUserNamesFromEnv(c.env),
+      });
+    }
+
+    const message = await sendDirectMessage(storage, {
+      from: c.get("session").name,
+      to: c.req.param("user"),
+      message: body.message,
+      fileIds,
+      allowedUsers: allUserNamesFromEnv(c.env),
+    });
+    const files = new Map((await visibleFiles(storage, c.get("session"))).map((file) => [file.id, file]));
+    return c.json({ message: messageForClient(message, files) }, 201);
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
 });
 
 app.get("/api/notifications", async (c) => {
@@ -1177,6 +1410,12 @@ function DriveApp({ storageName, session, nonce }: { storageName: string; sessio
             <span>通知</span>
             <small id="notification-count"></small>
           </button>
+          <button class="nav-item" type="button" data-action="profile">
+            <span>账号设置</span>
+          </button>
+          <button class="nav-item" type="button" data-action="friends">
+            <span>好友私信</span>
+          </button>
           <button class="nav-item" type="button" data-action="refresh">
             <span>刷新列表</span>
           </button>
@@ -1257,6 +1496,83 @@ function DriveApp({ storageName, session, nonce }: { storageName: string; sessio
             <span id="notification-status">暂无通知</span>
             <button id="mark-notifications-read" value="default" type="button">全部标为已读</button>
           </footer>
+        </form>
+      </dialog>
+
+      <dialog id="profile-dialog" class="modal profile-modal">
+        <form method="dialog" class="modal-panel" id="profile-form">
+          <header>
+            <h2>账号设置</h2>
+            <button value="cancel" aria-label="关闭">×</button>
+          </header>
+          <div class="profile-preview">
+            <span id="profile-avatar-preview" class="avatar-preview"></span>
+            <span>
+              <strong id="profile-preview-name">{session.name}</strong>
+              <small>用户名不可修改</small>
+            </span>
+          </div>
+          <label>
+            <span>昵称</span>
+            <input id="profile-nickname" maxLength={32} autocomplete="nickname" placeholder="设置唯一昵称" />
+          </label>
+          <label>
+            <span>状态</span>
+            <input id="profile-status-text" maxLength={80} autocomplete="off" placeholder="忙碌、在线、休假中..." />
+          </label>
+          <label>
+            <span>头像</span>
+            <input id="profile-avatar" type="file" accept="image/png,image/jpeg,image/webp,image/gif" />
+          </label>
+          <label>
+            <span>当前密码</span>
+            <input id="profile-current-password" type="password" autocomplete="current-password" placeholder="修改密码时填写" />
+          </label>
+          <label>
+            <span>新密码</span>
+            <input id="profile-new-password" type="password" autocomplete="new-password" placeholder="至少 8 位，留空则不修改" />
+          </label>
+          <label>
+            <span>确认新密码</span>
+            <input id="profile-confirm-password" type="password" autocomplete="new-password" placeholder="再次输入新密码" />
+          </label>
+          <output id="profile-status"></output>
+          <footer>
+            <button value="cancel">取消</button>
+            <button id="save-profile-button" value="default">保存资料</button>
+          </footer>
+        </form>
+      </dialog>
+
+      <dialog id="friends-dialog" class="modal friends-modal">
+        <form method="dialog" class="modal-panel" id="friends-form">
+          <header>
+            <h2>好友私信</h2>
+            <button value="cancel" aria-label="关闭">×</button>
+          </header>
+          <div class="friends-layout">
+            <section class="friends-sidebar">
+              <input id="friend-search" type="search" placeholder="搜索用户名、昵称、标签" autocomplete="off" />
+              <div id="friend-search-results" class="compact-list"></div>
+              <div id="friend-list" class="compact-list"></div>
+            </section>
+            <section class="chat-panel">
+              <div id="chat-heading" class="chat-heading">请选择好友</div>
+              <div id="message-list" class="message-list"></div>
+              <label>
+                <span>私信</span>
+                <textarea id="message-input" rows={3} placeholder="输入私信内容"></textarea>
+              </label>
+              <label>
+                <span>附带文件</span>
+                <select id="message-file-select" multiple size={5}></select>
+              </label>
+              <footer>
+                <span id="friends-status">未选择好友</span>
+                <button id="send-message-button" type="submit" disabled>发送</button>
+              </footer>
+            </section>
+          </div>
         </form>
       </dialog>
 
@@ -2120,12 +2436,150 @@ button.tag-chip {
   width: min(620px, calc(100vw - 28px));
 }
 
+.profile-modal {
+  width: min(520px, calc(100vw - 28px));
+}
+
+.friends-modal {
+  width: min(980px, calc(100vw - 28px));
+}
+
+.profile-preview {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--glass);
+}
+
+.avatar-preview,
+.avatar {
+  display: grid;
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--accent), var(--line) 42%);
+  border-radius: 50%;
+  color: white;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  font-size: 0.9rem;
+  font-weight: 800;
+}
+
+.avatar img,
+.avatar-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
 .notification-list {
   display: grid;
   max-height: min(54vh, 420px);
   overflow: auto;
   border: 1px solid var(--line);
   border-radius: var(--radius);
+}
+
+.friends-layout {
+  display: grid;
+  grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
+  gap: 14px;
+  min-height: 560px;
+}
+
+.friends-sidebar,
+.chat-panel {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  min-width: 0;
+}
+
+.compact-list,
+.message-list {
+  display: grid;
+  align-content: start;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--glass);
+}
+
+.compact-list {
+  max-height: 210px;
+}
+
+.compact-user {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 56px;
+  padding: 8px;
+  border: 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--line), transparent 35%);
+  border-radius: 0;
+  background: transparent;
+  text-align: left;
+}
+
+.compact-user:hover,
+.compact-user.active {
+  background: color-mix(in srgb, var(--accent), transparent 88%);
+}
+
+.compact-user strong,
+.compact-user small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-heading {
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  color: var(--muted);
+}
+
+.message-list {
+  min-height: 230px;
+  max-height: 260px;
+  padding: 8px;
+  gap: 8px;
+}
+
+.message-item {
+  display: grid;
+  gap: 4px;
+  max-width: 78%;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--glass-strong);
+}
+
+.message-item.own {
+  justify-self: end;
+  border-color: color-mix(in srgb, var(--accent), var(--line) 42%);
+  background: color-mix(in srgb, var(--accent), transparent 86%);
+}
+
+.message-item p {
+  margin: 0;
+  word-break: break-word;
+}
+
+.message-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
 }
 
 .notification-item {
@@ -2402,6 +2856,15 @@ button.tag-chip {
   .bulk-tools {
     grid-template-columns: 1fr;
   }
+
+  .friends-layout {
+    grid-template-columns: 1fr;
+    min-height: 0;
+  }
+
+  .message-item {
+    max-width: 100%;
+  }
 }
 `;
 
@@ -2414,7 +2877,11 @@ const clientScript = String.raw`
     contextId: null,
     dragging: null,
     query: "",
-    tag: ""
+    tag: "",
+    me: null,
+    friends: [],
+    friendResults: [],
+    activeFriend: ""
   };
 
   const SAFE_WRITE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
@@ -2444,6 +2911,30 @@ const clientScript = String.raw`
   const notificationList = document.getElementById("notification-list");
   const notificationStatus = document.getElementById("notification-status");
   const markNotificationsRead = document.getElementById("mark-notifications-read");
+  const profileButton = document.querySelector('[data-action="profile"]');
+  const friendsButton = document.querySelector('[data-action="friends"]');
+  const profileDialog = document.getElementById("profile-dialog");
+  const profileForm = document.getElementById("profile-form");
+  const profileNickname = document.getElementById("profile-nickname");
+  const profileStatusText = document.getElementById("profile-status-text");
+  const profileAvatar = document.getElementById("profile-avatar");
+  const profileCurrentPassword = document.getElementById("profile-current-password");
+  const profileNewPassword = document.getElementById("profile-new-password");
+  const profileConfirmPassword = document.getElementById("profile-confirm-password");
+  const profileAvatarPreview = document.getElementById("profile-avatar-preview");
+  const profilePreviewName = document.getElementById("profile-preview-name");
+  const profileStatus = document.getElementById("profile-status");
+  const friendsDialog = document.getElementById("friends-dialog");
+  const friendsForm = document.getElementById("friends-form");
+  const friendSearch = document.getElementById("friend-search");
+  const friendSearchResults = document.getElementById("friend-search-results");
+  const friendList = document.getElementById("friend-list");
+  const chatHeading = document.getElementById("chat-heading");
+  const messageList = document.getElementById("message-list");
+  const messageInput = document.getElementById("message-input");
+  const messageFileSelect = document.getElementById("message-file-select");
+  const friendsStatus = document.getElementById("friends-status");
+  const sendMessageButton = document.getElementById("send-message-button");
   const shareDialog = document.getElementById("share-dialog");
   const shareForm = document.getElementById("share-form");
   const permissionDialog = document.getElementById("permission-dialog");
@@ -2456,6 +2947,7 @@ const clientScript = String.raw`
   let permissions = { users: [], grants: {}, tags: [] };
   let selectedPermissionUser = "";
   let notifications = [];
+  let profileAvatarData = "";
 
   const buttons = {
     download: document.querySelector('[data-action="download-selected"]'),
@@ -2682,6 +3174,14 @@ const clientScript = String.raw`
     render();
   }
 
+  async function loadFilesSilently() {
+    const url = new URL("/api/files", location.origin);
+    if (state.query) url.searchParams.set("q", state.query);
+    if (state.tag) url.searchParams.set("tag", state.tag);
+    const data = await api(url.pathname + url.search);
+    state.files = data.files || [];
+  }
+
   function getExpiryValue() {
     const select = document.getElementById("retention-select");
     const custom = document.getElementById("custom-expiry");
@@ -2771,6 +3271,252 @@ const clientScript = String.raw`
       method: "PATCH",
       body: JSON.stringify({})
     });
+    await loadNotifications();
+  }
+
+  function initials(user) {
+    const label = user?.nickname || user?.name || "?";
+    return label.slice(0, 2).toUpperCase();
+  }
+
+  function renderAvatar(container, user) {
+    container.innerHTML = "";
+    if (user?.avatar) {
+      const image = document.createElement("img");
+      image.src = user.avatar;
+      image.alt = "";
+      container.append(image);
+      return;
+    }
+    container.textContent = initials(user);
+  }
+
+  async function loadMe() {
+    const data = await api("/api/me");
+    state.me = data.user || null;
+    return state.me;
+  }
+
+  function renderProfileForm() {
+    const me = state.me || { name: appRoot?.dataset.user || "" };
+    profileNickname.value = me.nickname || "";
+    profileStatusText.value = me.status || "";
+    profileCurrentPassword.value = "";
+    profileNewPassword.value = "";
+    profileConfirmPassword.value = "";
+    profileAvatarData = me.avatar || "";
+    profilePreviewName.textContent = (me.nickname ? me.nickname + " · " : "") + me.name;
+    renderAvatar(profileAvatarPreview, me);
+  }
+
+  async function openProfileDialog() {
+    await loadMe();
+    renderProfileForm();
+    profileStatus.value = "";
+    profileDialog.showModal();
+  }
+
+  async function saveProfile(event) {
+    event.preventDefault();
+    if (profileNewPassword.value || profileConfirmPassword.value) {
+      if (profileNewPassword.value !== profileConfirmPassword.value) {
+        profileStatus.value = "两次输入的新密码不一致";
+        return;
+      }
+      if (profileNewPassword.value.length < 8) {
+        profileStatus.value = "新密码至少需要 8 位";
+        return;
+      }
+      if (!profileCurrentPassword.value) {
+        profileStatus.value = "请输入当前密码";
+        return;
+      }
+    }
+    profileStatus.value = "正在保存...";
+    const data = await api("/api/me/profile", {
+      method: "PATCH",
+      body: JSON.stringify({
+        nickname: profileNickname.value,
+        status: profileStatusText.value,
+        avatar: profileAvatarData,
+        currentPassword: profileCurrentPassword.value,
+        newPassword: profileNewPassword.value
+      })
+    });
+    await loadMe();
+    renderProfileForm();
+    profileStatus.value = data.passwordChanged ? "账号设置已保存，请使用新密码登录" : "账号设置已保存";
+  }
+
+  function readAvatarFile(file) {
+    return new Promise((resolve, reject) => {
+      if (!file) {
+        resolve("");
+        return;
+      }
+      if (file.size > 36000) {
+        reject(new Error("头像不能超过 36KB"));
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ""));
+      reader.onerror = () => reject(new Error("头像读取失败"));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function userLine(user) {
+    return (user.nickname ? user.nickname + " · " : "") + user.name;
+  }
+
+  function renderCompactUser(user, actionText, onAction) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "compact-user" + (state.activeFriend === user.name ? " active" : "");
+    row.innerHTML =
+      '<span class="avatar"></span>' +
+      '<span>' +
+        '<strong></strong>' +
+        '<small></small>' +
+      '</span>' +
+      '<span class="tag-chip"></span>';
+    renderAvatar(row.querySelector(".avatar"), user);
+    row.querySelector("strong").textContent = user.nickname || user.name;
+    row.querySelector("small").textContent = user.status || (user.nickname ? user.name : (user.tags || []).join(", ") || "用户");
+    row.querySelector(".tag-chip").textContent = actionText;
+    row.addEventListener("click", () => onAction(user));
+    return row;
+  }
+
+  function renderFriendLists() {
+    friendList.innerHTML = "";
+    friendSearchResults.innerHTML = "";
+
+    if (!state.friendResults.length && friendSearch.value.trim()) {
+      const empty = document.createElement("span");
+      empty.className = "tag-empty";
+      empty.textContent = "没有匹配用户";
+      friendSearchResults.append(empty);
+    }
+    for (const user of state.friendResults) {
+      friendSearchResults.append(renderCompactUser(user, user.isFriend ? "已添加" : "添加", async (target) => {
+        if (!target.isFriend) await addFriendNow(target.name);
+        await selectFriend(target.name);
+      }));
+    }
+
+    if (!state.friends.length) {
+      const empty = document.createElement("span");
+      empty.className = "tag-empty";
+      empty.textContent = "还没有好友";
+      friendList.append(empty);
+    }
+    for (const user of state.friends) {
+      friendList.append(renderCompactUser(user, "聊天", (target) => selectFriend(target.name)));
+    }
+  }
+
+  function renderMessageFiles() {
+    messageFileSelect.innerHTML = "";
+    for (const file of state.files) {
+      const option = document.createElement("option");
+      option.value = file.id;
+      option.textContent = file.name;
+      messageFileSelect.append(option);
+    }
+  }
+
+  async function loadFriends() {
+    const data = await api("/api/friends");
+    state.friends = data.friends || [];
+    if (state.activeFriend && !state.friends.some((friend) => friend.name === state.activeFriend)) {
+      state.activeFriend = "";
+    }
+    renderFriendLists();
+  }
+
+  async function searchUsers() {
+    const query = friendSearch.value.trim();
+    if (!query) {
+      state.friendResults = [];
+      renderFriendLists();
+      return;
+    }
+    const data = await api("/api/users/search?q=" + encodeURIComponent(query));
+    state.friendResults = data.users || [];
+    renderFriendLists();
+  }
+
+  async function addFriendNow(user) {
+    friendsStatus.textContent = "正在添加好友...";
+    await api("/api/friends/" + encodeURIComponent(user), { method: "POST", body: JSON.stringify({}) });
+    await loadFriends();
+    state.friendResults = state.friendResults.map((item) => item.name === user ? { ...item, isFriend: true } : item);
+    renderFriendLists();
+    friendsStatus.textContent = "好友已添加";
+  }
+
+  function renderMessages(messages) {
+    messageList.innerHTML = "";
+    if (!messages.length) {
+      const empty = document.createElement("span");
+      empty.className = "tag-empty";
+      empty.textContent = "还没有私信";
+      messageList.append(empty);
+      return;
+    }
+
+    for (const message of messages) {
+      const item = document.createElement("article");
+      item.className = "message-item" + (message.from === state.me?.name ? " own" : "");
+      item.innerHTML = '<small></small><p></p><div class="message-files"></div>';
+      item.querySelector("small").textContent = formatDate(message.createdAt);
+      item.querySelector("p").textContent = message.message || "";
+      const files = item.querySelector(".message-files");
+      for (const file of message.files || []) {
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = "tag-chip";
+        chip.textContent = file.name;
+        chip.addEventListener("click", () => downloadIds([file.id]).catch((error) => notify(error.message, "error")));
+        files.append(chip);
+      }
+      messageList.append(item);
+    }
+    messageList.scrollTop = messageList.scrollHeight;
+  }
+
+  async function selectFriend(user) {
+    state.activeFriend = user;
+    const friend = state.friends.find((item) => item.name === user) || state.friendResults.find((item) => item.name === user);
+    chatHeading.textContent = friend ? userLine(friend) : user;
+    sendMessageButton.disabled = false;
+    renderFriendLists();
+    const data = await api("/api/messages/" + encodeURIComponent(user));
+    renderMessages(data.messages || []);
+    friendsStatus.textContent = "正在和 " + (friend?.nickname || user) + " 对话";
+  }
+
+  async function openFriendsDialog() {
+    await Promise.all([loadMe(), loadFriends(), loadFilesSilently()]);
+    renderMessageFiles();
+    friendsDialog.showModal();
+  }
+
+  async function sendMessage(event) {
+    event.preventDefault();
+    if (!state.activeFriend) return;
+    const fileIds = Array.from(messageFileSelect.selectedOptions).map((option) => option.value);
+    await api("/api/messages/" + encodeURIComponent(state.activeFriend), {
+      method: "POST",
+      body: JSON.stringify({
+        message: messageInput.value,
+        fileIds
+      })
+    });
+    messageInput.value = "";
+    for (const option of messageFileSelect.options) option.selected = false;
+    await selectFriend(state.activeFriend);
     await loadNotifications();
   }
 
@@ -3134,6 +3880,28 @@ const clientScript = String.raw`
   markNotificationsRead.addEventListener("click", () => markAllNotificationsRead().catch((error) => {
     notificationStatus.textContent = error.message;
   }));
+  profileButton.addEventListener("click", () => openProfileDialog().catch((error) => notify(error.message, "error")));
+  profileForm.addEventListener("submit", (event) => saveProfile(event).catch((error) => {
+    profileStatus.value = error.message;
+  }));
+  profileAvatar.addEventListener("change", () => readAvatarFile(profileAvatar.files?.[0]).then((avatar) => {
+    profileAvatarData = avatar;
+    renderAvatar(profileAvatarPreview, { name: state.me?.name || "", nickname: profileNickname.value, avatar });
+  }).catch((error) => {
+    profileStatus.value = error.message;
+    profileAvatar.value = "";
+  }));
+  friendsButton.addEventListener("click", () => openFriendsDialog().catch((error) => notify(error.message, "error")));
+  let friendSearchTimer = 0;
+  friendSearch.addEventListener("input", () => {
+    window.clearTimeout(friendSearchTimer);
+    friendSearchTimer = window.setTimeout(() => searchUsers().catch((error) => {
+      friendsStatus.textContent = error.message;
+    }), 180);
+  });
+  friendsForm.addEventListener("submit", (event) => sendMessage(event).catch((error) => {
+    friendsStatus.textContent = error.message;
+  }));
   fileInput.addEventListener("change", updatePendingFiles);
   applyBulkDescription.addEventListener("click", applyBulkDescriptionToFiles);
   applyBulkTags.addEventListener("click", applyBulkTagsToFiles);
@@ -3169,6 +3937,7 @@ const clientScript = String.raw`
   });
 
   loadFiles().catch((error) => notify(error.message, "error"));
+  loadMe().catch(() => {});
   loadNotifications().catch(() => {});
 })();
 `;

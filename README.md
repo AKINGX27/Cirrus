@@ -13,6 +13,8 @@
 - 右键菜单支持改名、修改描述、修改标签、下载、选择、复制、剪切、分享
 - Basic Auth 权限管理：普通用户默认只看自己的文件，管理员可看全部文件并为普通用户授权可见标签
 - 管理页面支持批量提权、恢复角色、添加用户标签、设置可见标签、设置可见文件和发送通知
+- 用户可在账号设置中修改密码、唯一昵称、头像和状态，按用户名、昵称、用户标签搜索其他用户
+- 好友之间可发送私信，也可把自己可见的文件发送给好友
 - 内置安全加固：安全响应头、CSP、CSRF 防护、同源校验、上传大小限制、基础速率限制
 - 左键可在列表空白处框选多个文件
 - 分享支持免密码或密码分享、有效期、自定义或自动分享码
@@ -167,7 +169,24 @@ admin:change-me:admin,alice:alice-password:user,bob:bob-password:user
 
 历史版本上传的旧文件没有 `owner` 字段，会只对管理员可见。需要让普通用户看到旧文件时，管理员可以重新上传或复制并设置标签和 owner。
 
-### 5. 安全防护配置
+### 5. 用户资料、好友和私信
+
+登录后，用户左侧会显示 `账号设置` 和 `好友私信`：
+
+| 功能 | 说明 |
+| --- | --- |
+| 修改密码 | 输入当前密码和新密码后保存；新密码会覆盖 `AUTH_USERS` 中的初始密码 |
+| 昵称 | 用户自己设置，系统会拒绝重复昵称 |
+| 头像 | 用户自己上传小头像；头像以 data URL 存在用户资料里，建议使用压缩后的图片 |
+| 状态 | 用户自己设置，好友列表会显示状态 |
+| 搜索用户 | 支持按用户名、昵称、管理员设置的用户标签搜索 |
+| 添加好友 | 搜索到用户后可添加好友；当前实现是双向好友关系 |
+| 私信 | 只能给好友发送私信 |
+| 分享文件给好友 | 在好友私信中附带自己可见的文件；发送后对方会获得该文件的指定可见权限 |
+
+好友、昵称、头像、状态、指定可见文件和通知都存放在 `permissions/user-profiles.json`。修改后的密码哈希存放在 `accounts/passwords.json`；`AUTH_USERS` 仍然是账号来源和初始密码来源。私信记录按会话存放在 `messages/` 前缀下。文件对象本身不会复制，好友收到的是对原文件的可见授权。
+
+### 6. 安全防护配置
 
 项目默认启用这些防护：
 
@@ -198,7 +217,7 @@ admin:change-me:admin,alice:alice-password:user,bob:bob-password:user
 | Environment variable | `SHARE_VERIFY_RATE_LIMIT_PER_MINUTE` | `30` | 单个客户端每分钟分享密码验证次数 |
 | Environment variable | `ALLOW_UNCONFIGURED_AUTH` | `false` | 仅本地开发建议使用，不要在公网开启 |
 
-### 6. AWS S3 配置
+### 7. AWS S3 配置
 
 `wrangler.s3.jsonc` 用于 S3 部署，注意它没有 `r2_buckets`：
 
@@ -245,7 +264,7 @@ S3 部署时，Workers Builds 仍然填写 `Deploy command` 为：
 npm run deploy:s3
 ```
 
-### 7. 部署后怎么检查
+### 8. 部署后怎么检查
 
 部署完成后，Cloudflare 会显示一个 `workers.dev` 地址，通常类似：
 
@@ -262,7 +281,7 @@ https://cirrus-drive.<你的-workers-子域>.workers.dev
 
 后续只要向生产分支推送代码，Workers Builds 会自动重新部署。
 
-### 8. 常见问题
+### 9. 常见问题
 
 如果构建失败并提示 Worker 名称不匹配，确认 Dashboard 的 `Project name` / `Worker name` 和 `wrangler.jsonc` 的 `name` 都是 `cirrus-drive`。
 
@@ -309,4 +328,4 @@ https://cirrus-drive.<你的-workers-子域>.workers.dev
 
 ## 说明
 
-当前版本是单 bucket 实现：文件对象存放在 `objects/`，文件元数据存放在 `meta/`，分享记录存放在 `shares/`，可见标签授权存放在 `permissions/tag-grants.json`，管理页面的用户资料、角色覆盖、指定可见文件和通知存放在 `permissions/user-profiles.json`。选择 R2 或 S3 只会影响这些对象存放在哪个对象存储后端。文件过期会在列表读取和文件读取时自动清理。
+当前版本是单 bucket 实现：文件对象存放在 `objects/`，文件元数据存放在 `meta/`，分享记录存放在 `shares/`，私信记录存放在 `messages/`，账号密码覆盖哈希存放在 `accounts/passwords.json`，可见标签授权存放在 `permissions/tag-grants.json`，用户资料、头像、状态、好友关系、角色覆盖、指定可见文件和通知存放在 `permissions/user-profiles.json`。选择 R2 或 S3 只会影响这些对象存放在哪个对象存储后端。文件过期会在列表读取和文件读取时自动清理。
