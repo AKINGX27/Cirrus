@@ -32,6 +32,17 @@ type UserRole = "admin" | "user";
 
 interface AuthEnv {
   AUTH_USERS?: string;
+  ALLOW_UNCONFIGURED_AUTH?: string;
+  CSRF_SECRET?: string;
+  API_RATE_LIMIT_PER_MINUTE?: string;
+  AUTH_RATE_LIMIT_PER_MINUTE?: string;
+  SHARE_VERIFY_RATE_LIMIT_PER_MINUTE?: string;
+  MAX_FILE_BYTES?: string;
+  MAX_UPLOAD_BYTES?: string;
+  MAX_FILES_PER_UPLOAD?: string;
+  MAX_JSON_BYTES?: string;
+  MAX_SELECTED_FILES?: string;
+  MAX_SHARE_FILES?: string;
 }
 
 interface AuthUser {
@@ -48,7 +59,33 @@ interface AuthSession {
 
 type Bindings = StorageEnv & AuthEnv;
 
-const app = new Hono<{ Bindings: Bindings; Variables: { session: AuthSession } }>();
+interface AppVariables {
+  session: AuthSession;
+  nonce: string;
+  csrfToken: string;
+}
+
+const app = new Hono<{ Bindings: Bindings; Variables: AppVariables }>();
+
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+const DEFAULT_MAX_FILE_BYTES = 100 * 1024 * 1024;
+const DEFAULT_MAX_UPLOAD_BYTES = 250 * 1024 * 1024;
+const DEFAULT_MAX_FILES_PER_UPLOAD = 50;
+const DEFAULT_MAX_JSON_BYTES = 64 * 1024;
+const DEFAULT_MAX_SELECTED_FILES = 500;
+const DEFAULT_MAX_SHARE_FILES = 100;
+const DEFAULT_API_RATE_LIMIT_PER_MINUTE = 300;
+const DEFAULT_AUTH_RATE_LIMIT_PER_MINUTE = 60;
+const DEFAULT_SHARE_VERIFY_RATE_LIMIT_PER_MINUTE = 30;
+
+interface RateBucket {
+  count: number;
+  resetAt: number;
+}
+
+const rateBuckets =
+  ((globalThis as typeof globalThis & { __cirrusRateBuckets?: Map<string, RateBucket> }).__cirrusRateBuckets ??=
+    new Map<string, RateBucket>());
 
 function jsonError(error: unknown) {
   if (error instanceof AppError) {
@@ -72,7 +109,15 @@ function jsonError(error: unknown) {
 }
 
 function errorResponse(message: string, status: number) {
-  return Response.json({ error: message }, { status });
+  return Response.json(
+    { error: message },
+    {
+      status,
+      headers: {
+        "Cache-Control": "no-store",
+      },
+    },
+  );
 }
 
 function isUploadedFile(value: unknown): value is File {
@@ -84,30 +129,239 @@ function attachmentName(name: string) {
   return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(name)}`;
 }
 
-async function jsonBody<T>(request: Request) {
+async function jsonBody<T>(request: Request, maxBytes = DEFAULT_MAX_JSON_BYTES) {
+  const contentLength = parseContentLength(request.headers.get("Content-Length"));
+  if (contentLength !== null && contentLength > maxBytes) {
+    throw new AppError("请求体过大", 413);
+  }
+
+  let text = "";
   try {
-    return (await request.json()) as T;
+    text = await request.text();
+  } catch {
+    throw new AppError("请求体读取失败");
+  }
+
+  if (new TextEncoder().encode(text).byteLength > maxBytes) {
+    throw new AppError("请求体过大", 413);
+  }
+
+  try {
+    return JSON.parse(text) as T;
   } catch {
     throw new AppError("请求体不是有效 JSON");
   }
 }
 
-function idsFromValue(value: unknown) {
+function idsFromValue(value: unknown, maxIds = DEFAULT_MAX_SELECTED_FILES) {
   if (!Array.isArray(value)) throw new AppError("请选择文件");
-  const ids = value.filter((id): id is string => typeof id === "string" && id.length > 0);
+  const ids = value
+    .filter((id): id is string => typeof id === "string" && isUuid(id))
+    .slice(0, maxIds + 1);
   if (!ids.length) throw new AppError("请选择文件");
+  if (ids.length > maxIds) throw new AppError("选择的文件过多", 413);
   return Array.from(new Set(ids));
+}
+
+function isUuid(value: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function randomToken(bytes = 18) {
+  const values = new Uint8Array(bytes);
+  crypto.getRandomValues(values);
+  return base64Url(values);
+}
+
+function base64Url(bytes: Uint8Array) {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function parseContentLength(value: string | null) {
+  if (!value) return null;
+  const length = Number(value);
+  return Number.isSafeInteger(length) && length >= 0 ? length : null;
+}
+
+function parsePositiveInt(value: string | undefined, fallback: number, max = Number.MAX_SAFE_INTEGER) {
+  if (!value) return fallback;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) return fallback;
+  return Math.min(parsed, max);
+}
+
+function maxFileBytes(env: Bindings) {
+  return parsePositiveInt(env.MAX_FILE_BYTES, DEFAULT_MAX_FILE_BYTES);
+}
+
+function maxUploadBytes(env: Bindings) {
+  return parsePositiveInt(env.MAX_UPLOAD_BYTES, DEFAULT_MAX_UPLOAD_BYTES);
+}
+
+function maxFilesPerUpload(env: Bindings) {
+  return parsePositiveInt(env.MAX_FILES_PER_UPLOAD, DEFAULT_MAX_FILES_PER_UPLOAD, 200);
+}
+
+function maxJsonBytes(env: Bindings) {
+  return parsePositiveInt(env.MAX_JSON_BYTES, DEFAULT_MAX_JSON_BYTES, 1024 * 1024);
+}
+
+function maxSelectedFiles(env: Bindings) {
+  return parsePositiveInt(env.MAX_SELECTED_FILES, DEFAULT_MAX_SELECTED_FILES, 5000);
+}
+
+function maxShareFiles(env: Bindings) {
+  return parsePositiveInt(env.MAX_SHARE_FILES, DEFAULT_MAX_SHARE_FILES, 1000);
+}
+
+function apiRateLimit(env: Bindings) {
+  return parsePositiveInt(env.API_RATE_LIMIT_PER_MINUTE, DEFAULT_API_RATE_LIMIT_PER_MINUTE, 10000);
+}
+
+function authRateLimit(env: Bindings) {
+  return parsePositiveInt(env.AUTH_RATE_LIMIT_PER_MINUTE, DEFAULT_AUTH_RATE_LIMIT_PER_MINUTE, 10000);
+}
+
+function shareVerifyRateLimit(env: Bindings) {
+  return parsePositiveInt(env.SHARE_VERIFY_RATE_LIMIT_PER_MINUTE, DEFAULT_SHARE_VERIFY_RATE_LIMIT_PER_MINUTE, 10000);
+}
+
+function truthyEnv(value: string | undefined) {
+  return /^(1|true|yes|on)$/i.test(value?.trim() || "");
+}
+
+function requestHost(request: Request) {
+  return request.headers.get("Host") || new URL(request.url).host;
+}
+
+function requestClientKey(request: Request) {
+  return (
+    request.headers.get("CF-Connecting-IP") ||
+    request.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() ||
+    "unknown"
+  );
+}
+
+function rateLimitResponse() {
+  return Response.json(
+    { error: "请求过于频繁，请稍后再试" },
+    {
+      status: 429,
+      headers: {
+        "Cache-Control": "no-store",
+        "Retry-After": "60",
+      },
+    },
+  );
+}
+
+function consumeRateLimit(key: string, limit: number, windowMs = 60_000) {
+  const now = Date.now();
+  const bucket = rateBuckets.get(key);
+  if (!bucket || bucket.resetAt <= now) {
+    rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
+    return true;
+  }
+
+  if (bucket.count >= limit) return false;
+  bucket.count += 1;
+
+  if (rateBuckets.size > 5000) {
+    for (const [bucketKey, value] of rateBuckets) {
+      if (value.resetAt <= now) rateBuckets.delete(bucketKey);
+    }
+  }
+
+  return true;
+}
+
+function isCrossSiteSubresource(request: Request) {
+  const site = request.headers.get("Sec-Fetch-Site");
+  const mode = request.headers.get("Sec-Fetch-Mode");
+  const dest = request.headers.get("Sec-Fetch-Dest");
+
+  if (site !== "cross-site") return false;
+  if (mode === "navigate" && (dest === "document" || dest === "empty")) return false;
+  return true;
+}
+
+function isSameOriginRequest(request: Request) {
+  const expectedHost = requestHost(request);
+  for (const headerName of ["Origin", "Referer"]) {
+    const value = request.headers.get(headerName);
+    if (!value) continue;
+    let url: URL;
+    try {
+      url = new URL(value);
+    } catch {
+      return false;
+    }
+    if (url.host !== expectedHost) return false;
+    if (url.protocol !== "https:" && url.hostname !== "localhost" && url.hostname !== "127.0.0.1") {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function sha256Bytes(input: string) {
+  const bytes = new TextEncoder().encode(input);
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+}
+
+async function csrfTokenForSession(env: Bindings, session: AuthSession) {
+  const secret = env.CSRF_SECRET?.trim() || env.AUTH_USERS?.trim() || "cirrus-dev-csrf-secret";
+  const bytes = await sha256Bytes(`${secret}:${session.name}:${session.role}`);
+  return base64Url(bytes);
+}
+
+function safeResponseHeaders(nonce: string) {
+  const csp = [
+    "default-src 'self'",
+    `script-src 'self' 'nonce-${nonce}'`,
+    `style-src 'self' 'nonce-${nonce}'`,
+    "img-src 'self' data:",
+    "font-src 'self'",
+    "connect-src 'self'",
+    "media-src 'none'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+    "upgrade-insecure-requests",
+  ].join("; ");
+
+  return {
+    "Cache-Control": "no-store",
+    "Content-Security-Policy": csp,
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Origin-Agent-Cluster": "?1",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=(), fullscreen=(self), clipboard-write=(self)",
+    "Referrer-Policy": "same-origin",
+    "Strict-Transport-Security": "max-age=63072000; includeSubDomains; preload",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "X-Permitted-Cross-Domain-Policies": "none",
+    "X-Robots-Tag": "noindex, nofollow, noarchive",
+  };
 }
 
 function parseAuthUsers(value: string | undefined) {
   const users: AuthUser[] = [];
+  const seen = new Set<string>();
 
   for (const entry of (value || "").split(",")) {
     const [rawName, password = "", rawRole = "user"] = entry.split(":");
     const name = rawName?.trim();
     const role = rawRole.trim().toLowerCase() === "admin" ? "admin" : "user";
 
-    if (!name || !password) continue;
+    if (!name || !password || !/^[A-Za-z0-9_.-]{1,64}$/.test(name) || seen.has(name)) continue;
+    seen.add(name);
     users.push({ name, password, role });
   }
 
@@ -140,6 +394,7 @@ function unauthorizedResponse() {
 function authenticate(request: Request, env: Bindings): AuthSession | null {
   const users = parseAuthUsers(env.AUTH_USERS);
   if (!users.length) {
+    if (!truthyEnv(env.ALLOW_UNCONFIGURED_AUTH) && !isLocalRequest(request)) return null;
     return { name: "admin", role: "admin", configured: false };
   }
 
@@ -162,6 +417,11 @@ function authenticate(request: Request, env: Bindings): AuthSession | null {
   if (!user || !timingSafeEqual(user.password, password)) return null;
 
   return { name: user.name, role: user.role, configured: true };
+}
+
+function isLocalRequest(request: Request) {
+  const host = requestHost(request).split(":")[0];
+  return host === "localhost" || host === "127.0.0.1" || host === "::1";
 }
 
 function fileMatchesVisibleTags(file: DriveFileMeta, tags: string[]) {
@@ -247,6 +507,11 @@ function knownTags(files: DriveFileMeta[], grants: UserTagGrants) {
   return Array.from(tags.values()).sort((a, b) => a.localeCompare(b, "zh-CN"));
 }
 
+function fileForClient(file: DriveFileMeta) {
+  const { owner: _owner, ...publicFile } = file;
+  return publicFile;
+}
+
 async function zipResponse(storage: ObjectStorage, files: DriveFileMeta[], archiveName: string) {
   if (!files.length) throw new AppError("文件不存在", 404);
 
@@ -271,6 +536,7 @@ async function zipResponse(storage: ObjectStorage, files: DriveFileMeta[], archi
       "Content-Type": "application/zip",
       "Content-Disposition": attachmentName(archiveName),
       "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
     },
   });
 }
@@ -287,19 +553,24 @@ async function singleFileResponse(storage: ObjectStorage, file: DriveFileMeta) {
       "Content-Length": String(file.size),
       "Content-Disposition": attachmentName(file.name),
       "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
     },
   });
 }
 
 app.use(
-  jsxRenderer(({ children }) => {
+  jsxRenderer(({ children }, c) => {
+    const nonce = c.get("nonce");
+    const csrfToken = c.get("csrfToken");
+
     return (
       <html lang="zh-CN">
         <head>
           <meta charset="utf-8" />
           <meta name="viewport" content="width=device-width, initial-scale=1" />
+          <meta name="csrf-token" content={csrfToken} />
           <title>Cirrus Drive</title>
-          <style dangerouslySetInnerHTML={{ __html: styles }} />
+          <style nonce={nonce} dangerouslySetInnerHTML={{ __html: styles }} />
         </head>
         <body>{children}</body>
       </html>
@@ -307,46 +578,118 @@ app.use(
   }),
 );
 
-app.use("/api/*", async (c, next) => {
-  const path = new URL(c.req.url).pathname;
-  const isPublicShareRead = c.req.method === "GET" && /^\/api\/shares\/[^/]+$/.test(path);
-  const isPublicShareDownload = c.req.method === "POST" && /^\/api\/shares\/[^/]+\/download$/.test(path);
-  if (isPublicShareRead || isPublicShareDownload) {
+app.use("*", async (c, next) => {
+  const nonce = randomToken();
+  c.set("nonce", nonce);
+  c.set("csrfToken", "");
+
+  try {
+    await next();
+  } finally {
+    const headers = safeResponseHeaders(nonce);
+    for (const [name, value] of Object.entries(headers)) {
+      c.header(name, value);
+    }
+  }
+});
+
+app.use("*", async (c, next) => {
+  if (isCrossSiteSubresource(c.req.raw)) {
+    return errorResponse("跨站请求被拒绝", 403);
+  }
+
+  if (SAFE_METHODS.has(c.req.method)) {
     await next();
     return;
   }
 
-  const session = authenticate(c.req.raw, c.env);
-  if (!session) return unauthorizedResponse();
-  c.set("session", session);
+  if (!isSameOriginRequest(c.req.raw)) {
+    return errorResponse("请求来源无效", 403);
+  }
+
   await next();
 });
 
-app.get("/", (c) => {
+app.use("/api/*", async (c, next) => {
+  const path = new URL(c.req.url).pathname;
+  const clientKey = requestClientKey(c.req.raw);
+  if (!consumeRateLimit(`api:${clientKey}`, apiRateLimit(c.env))) {
+    return rateLimitResponse();
+  }
+
+  const isPublicShareRead = c.req.method === "GET" && /^\/api\/shares\/[^/]+$/.test(path);
+  const isPublicShareVerify = c.req.method === "POST" && /^\/api\/shares\/[^/]+\/verify$/.test(path);
+  const isPublicShareDownload = c.req.method === "POST" && /^\/api\/shares\/[^/]+\/download$/.test(path);
+  if (isPublicShareVerify && !consumeRateLimit(`share-verify:${clientKey}:${path}`, shareVerifyRateLimit(c.env))) {
+    return rateLimitResponse();
+  }
+  if (isPublicShareRead || isPublicShareVerify || isPublicShareDownload) {
+    await next();
+    return;
+  }
+
+  if (!consumeRateLimit(`auth:${clientKey}`, authRateLimit(c.env))) {
+    return rateLimitResponse();
+  }
   const session = authenticate(c.req.raw, c.env);
   if (!session) return unauthorizedResponse();
-  return c.render(<DriveApp storageName={storageLabel(c.env)} session={session} />);
+  c.set("session", session);
+
+  const csrfToken = await csrfTokenForSession(c.env, session);
+  c.set("csrfToken", csrfToken);
+  if (!SAFE_METHODS.has(c.req.method) && c.req.header("X-CSRF-Token") !== csrfToken) {
+    return errorResponse("CSRF token 无效", 403);
+  }
+
+  await next();
+});
+
+app.get("/", async (c) => {
+  if (!consumeRateLimit(`auth:${requestClientKey(c.req.raw)}`, authRateLimit(c.env))) {
+    return rateLimitResponse();
+  }
+  const session = authenticate(c.req.raw, c.env);
+  if (!session) return unauthorizedResponse();
+  c.set("csrfToken", await csrfTokenForSession(c.env, session));
+  return c.render(<DriveApp storageName={storageLabel(c.env)} session={session} nonce={c.get("nonce")} />);
 });
 
 app.get("/s/:code", (c) => {
   const code = c.req.param("code");
-  return c.render(<ShareApp code={code} />);
+  return c.render(<ShareApp code={code} nonce={c.get("nonce")} />);
 });
 
 app.get("/api/files", async (c) => {
   const storage = createObjectStorage(c.env);
   const files = filterFiles(await visibleFiles(storage, c.get("session")), c.req.query("q"), c.req.query("tag"));
-  return c.json({ files });
+  return c.json({ files: files.map(fileForClient) });
 });
 
 app.post("/api/files", async (c) => {
   try {
+    const contentLength = parseContentLength(c.req.header("Content-Length") || null);
+    if (contentLength !== null && contentLength > maxUploadBytes(c.env)) {
+      throw new AppError("上传内容过大", 413);
+    }
+
     const form = await c.req.formData();
     const expiresAt = parseOptionalDate(form.get("expiresAt"));
     const files = (form.getAll("files") as unknown[]).filter(isUploadedFile);
 
     if (!files.length) {
       throw new AppError("请选择要上传的文件");
+    }
+    if (files.length > maxFilesPerUpload(c.env)) {
+      throw new AppError("一次上传的文件过多", 413);
+    }
+
+    const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+    if (totalBytes > maxUploadBytes(c.env)) {
+      throw new AppError("上传内容过大", 413);
+    }
+    const perFileLimit = maxFileBytes(c.env);
+    if (files.some((file) => file.size > perFileLimit)) {
+      throw new AppError("单个文件过大", 413);
     }
 
     const storage = createObjectStorage(c.env);
@@ -361,7 +704,7 @@ app.post("/api/files", async (c) => {
       }),
     );
 
-    return c.json({ files: uploaded }, 201);
+    return c.json({ files: uploaded.map(fileForClient) }, 201);
   } catch (error) {
     const { message, status } = jsonError(error);
     return errorResponse(message, status);
@@ -370,11 +713,11 @@ app.post("/api/files", async (c) => {
 
 app.patch("/api/files/:id/description", async (c) => {
   try {
-    const body = await jsonBody<{ description?: unknown }>(c.req.raw);
+    const body = await jsonBody<{ description?: unknown }>(c.req.raw, maxJsonBytes(c.env));
     const storage = createObjectStorage(c.env);
     requireManageFile(c.get("session"), await getActiveFileMeta(storage, c.req.param("id")));
     const file = await updateFileDescription(storage, c.req.param("id"), cleanDescription(body.description));
-    return c.json({ file });
+    return c.json({ file: fileForClient(file) });
   } catch (error) {
     const { message, status } = jsonError(error);
     return errorResponse(message, status);
@@ -383,11 +726,11 @@ app.patch("/api/files/:id/description", async (c) => {
 
 app.patch("/api/files/:id/tags", async (c) => {
   try {
-    const body = await jsonBody<{ tags?: unknown }>(c.req.raw);
+    const body = await jsonBody<{ tags?: unknown }>(c.req.raw, maxJsonBytes(c.env));
     const storage = createObjectStorage(c.env);
     requireManageFile(c.get("session"), await getActiveFileMeta(storage, c.req.param("id")));
     const file = await updateFileTags(storage, c.req.param("id"), cleanTags(body.tags));
-    return c.json({ file });
+    return c.json({ file: fileForClient(file) });
   } catch (error) {
     const { message, status } = jsonError(error);
     return errorResponse(message, status);
@@ -396,14 +739,14 @@ app.patch("/api/files/:id/tags", async (c) => {
 
 app.patch("/api/files/:id", async (c) => {
   try {
-    const body = await jsonBody<{ name?: unknown }>(c.req.raw);
+    const body = await jsonBody<{ name?: unknown }>(c.req.raw, maxJsonBytes(c.env));
     if (typeof body.name !== "string" || !body.name.trim()) {
       throw new AppError("请输入文件名");
     }
     const storage = createObjectStorage(c.env);
     requireManageFile(c.get("session"), await getActiveFileMeta(storage, c.req.param("id")));
     const file = await renameFile(storage, c.req.param("id"), body.name);
-    return c.json({ file });
+    return c.json({ file: fileForClient(file) });
   } catch (error) {
     const { message, status } = jsonError(error);
     return errorResponse(message, status);
@@ -412,8 +755,8 @@ app.patch("/api/files/:id", async (c) => {
 
 app.delete("/api/files", async (c) => {
   try {
-    const body = await jsonBody<{ ids?: unknown }>(c.req.raw);
-    const ids = idsFromValue(body.ids);
+    const body = await jsonBody<{ ids?: unknown }>(c.req.raw, maxJsonBytes(c.env));
+    const ids = idsFromValue(body.ids, maxSelectedFiles(c.env));
     const storage = createObjectStorage(c.env);
     const session = c.get("session");
     const files = await Promise.all(ids.map((id) => getActiveFileMeta(storage, id)));
@@ -430,8 +773,8 @@ app.delete("/api/files", async (c) => {
 
 app.post("/api/files/copy", async (c) => {
   try {
-    const body = await jsonBody<{ ids?: unknown }>(c.req.raw);
-    const ids = idsFromValue(body.ids);
+    const body = await jsonBody<{ ids?: unknown }>(c.req.raw, maxJsonBytes(c.env));
+    const ids = idsFromValue(body.ids, maxSelectedFiles(c.env));
     const storage = createObjectStorage(c.env);
     const session = c.get("session");
     const sources = await Promise.all(ids.map((id) => getActiveFileMeta(storage, id)));
@@ -439,7 +782,7 @@ app.post("/api/files/copy", async (c) => {
       requireManageFile(session, file);
     }
     const files = await copyFiles(storage, ids, session.name);
-    return c.json({ files });
+    return c.json({ files: files.map(fileForClient) });
   } catch (error) {
     const { message, status } = jsonError(error);
     return errorResponse(message, status);
@@ -463,8 +806,8 @@ app.get("/api/files/:id/download", async (c) => {
 
 app.post("/api/files/download", async (c) => {
   try {
-    const body = await jsonBody<{ ids?: unknown }>(c.req.raw);
-    const ids = idsFromValue(body.ids);
+    const body = await jsonBody<{ ids?: unknown }>(c.req.raw, maxJsonBytes(c.env));
+    const ids = idsFromValue(body.ids, maxSelectedFiles(c.env));
     const storage = createObjectStorage(c.env);
     const allowed = new Map((await visibleFiles(storage, c.get("session"))).map((file) => [file.id, file]));
     const files = ids.map((id) => allowed.get(id)).filter(Boolean) as DriveFileMeta[];
@@ -488,10 +831,10 @@ app.post("/api/shares", async (c) => {
       code?: unknown;
       password?: unknown;
       expiresAt?: unknown;
-    }>(c.req.raw);
+    }>(c.req.raw, maxJsonBytes(c.env));
 
     const input: CreateShareInput = {
-      fileIds: idsFromValue(body.fileIds),
+      fileIds: idsFromValue(body.fileIds, maxShareFiles(c.env)),
       code: typeof body.code === "string" && body.code.trim() ? body.code : undefined,
       password: typeof body.password === "string" && body.password.trim() ? body.password : undefined,
       expiresAt: parseOptionalDate(body.expiresAt),
@@ -523,9 +866,7 @@ app.get("/api/shares/:code", async (c) => {
     const share = await getShare(storage, c.req.param("code"));
     if (!share) throw new AppError("分享不存在或已过期", 404);
 
-    const password = c.req.query("password");
-    const verified = await verifySharePassword(share, password);
-    if (!verified) {
+    if (share.passwordHash) {
       return c.json({
         locked: true,
         code: share.code,
@@ -538,7 +879,31 @@ app.get("/api/shares/:code", async (c) => {
       locked: false,
       code: share.code,
       expiresAt: share.expiresAt,
-      files,
+      files: files.map(fileForClient),
+    });
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
+
+app.post("/api/shares/:code/verify", async (c) => {
+  try {
+    const body = await jsonBody<{ password?: unknown }>(c.req.raw, maxJsonBytes(c.env));
+    const storage = createObjectStorage(c.env);
+    const share = await getShare(storage, c.req.param("code"));
+    if (!share) throw new AppError("分享不存在或已过期", 404);
+
+    const password = typeof body.password === "string" ? body.password : undefined;
+    const verified = await verifySharePassword(share, password);
+    if (!verified) throw new AppError("密码不正确", 403);
+
+    const files = await resolveShareFiles(storage, share);
+    return c.json({
+      locked: false,
+      code: share.code,
+      expiresAt: share.expiresAt,
+      files: files.map(fileForClient),
     });
   } catch (error) {
     const { message, status } = jsonError(error);
@@ -548,7 +913,7 @@ app.get("/api/shares/:code", async (c) => {
 
 app.post("/api/shares/:code/download", async (c) => {
   try {
-    const body = await jsonBody<{ password?: unknown; ids?: unknown }>(c.req.raw);
+    const body = await jsonBody<{ password?: unknown; ids?: unknown }>(c.req.raw, maxJsonBytes(c.env));
     const storage = createObjectStorage(c.env);
     const share = await getShare(storage, c.req.param("code"));
     if (!share) throw new AppError("分享不存在或已过期", 404);
@@ -558,7 +923,7 @@ app.post("/api/shares/:code/download", async (c) => {
     if (!verified) throw new AppError("密码不正确", 403);
 
     const allFiles = await resolveShareFiles(storage, share);
-    const requestedIds = body.ids ? new Set(idsFromValue(body.ids)) : null;
+    const requestedIds = body.ids ? new Set(idsFromValue(body.ids, maxShareFiles(c.env))) : null;
     const files = requestedIds ? allFiles.filter((file) => requestedIds.has(file.id)) : allFiles;
 
     if (files.length === 1) {
@@ -593,9 +958,11 @@ app.get("/api/admin/permissions", async (c) => {
 app.patch("/api/admin/permissions/:user", async (c) => {
   try {
     requireAdmin(c.get("session"));
-    const body = await jsonBody<{ tags?: unknown }>(c.req.raw);
+    const body = await jsonBody<{ tags?: unknown }>(c.req.raw, maxJsonBytes(c.env));
     const storage = createObjectStorage(c.env);
-    const tags = await setUserVisibleTags(storage, c.req.param("user"), cleanTags(body.tags));
+    const tags = await setUserVisibleTags(storage, c.req.param("user"), cleanTags(body.tags), {
+      allowedUsers: userNamesFromEnv(c.env),
+    });
 
     return c.json({ user: c.req.param("user"), tags });
   } catch (error) {
@@ -604,7 +971,7 @@ app.patch("/api/admin/permissions/:user", async (c) => {
   }
 });
 
-function DriveApp({ storageName, session }: { storageName: string; session: AuthSession }) {
+function DriveApp({ storageName, session, nonce }: { storageName: string; session: AuthSession; nonce: string }) {
   return (
     <main
       class="app-shell"
@@ -787,12 +1154,12 @@ function DriveApp({ storageName, session }: { storageName: string; session: Auth
         </form>
       </dialog>
 
-      <script dangerouslySetInnerHTML={{ __html: clientScript }} />
+      <script nonce={nonce} dangerouslySetInnerHTML={{ __html: clientScript }} />
     </main>
   );
 }
 
-function ShareApp({ code }: { code: string }) {
+function ShareApp({ code, nonce }: { code: string; nonce: string }) {
   return (
     <main class="share-shell" data-app="share" data-share-code={code}>
       <section class="share-panel">
@@ -818,7 +1185,7 @@ function ShareApp({ code }: { code: string }) {
         </div>
         <div id="share-file-list" class="file-list shared"></div>
       </section>
-      <script dangerouslySetInnerHTML={{ __html: shareClientScript }} />
+      <script nonce={nonce} dangerouslySetInnerHTML={{ __html: shareClientScript }} />
     </main>
   );
 }
@@ -1570,6 +1937,8 @@ const clientScript = String.raw`
     tag: ""
   };
 
+  const SAFE_WRITE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+  const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || "";
   const appRoot = document.querySelector("[data-app='drive']");
   const isAdmin = appRoot?.dataset.role === "admin";
   const list = document.getElementById("file-list");
@@ -1617,12 +1986,15 @@ const clientScript = String.raw`
   }
 
   async function api(path, options = {}) {
+    const headers = {
+      ...(options.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
+      ...(SAFE_WRITE_METHODS.has((options.method || "GET").toUpperCase()) && csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
+      ...(options.headers || {})
+    };
+
     const response = await fetch(path, {
       ...options,
-      headers: {
-        ...(options.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
-        ...(options.headers || {})
-      }
+      headers
     });
 
     if (!response.ok) {
@@ -1951,7 +2323,10 @@ const clientScript = String.raw`
     notify("正在打包 " + ids.length + " 个文件...");
     const response = await fetch("/api/files/download", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRF-Token": csrfToken
+      },
       body: JSON.stringify({ ids })
     });
     if (!response.ok) {
@@ -2267,9 +2642,14 @@ const shareClientScript = String.raw`
 
   async function fetchShare() {
     status.textContent = "正在读取分享...";
-    const url = new URL("/api/shares/" + encodeURIComponent(code), location.origin);
-    if (state.password) url.searchParams.set("password", state.password);
-    const response = await fetch(url);
+    const path = "/api/shares/" + encodeURIComponent(code);
+    const response = state.password
+      ? await fetch(path + "/verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: state.password })
+        })
+      : await fetch(path);
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || "分享读取失败");
 

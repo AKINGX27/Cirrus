@@ -34,6 +34,10 @@ export interface CreateShareInput {
   expiresAt?: string | null;
 }
 
+export interface SetUserVisibleTagsOptions {
+  allowedUsers?: string[];
+}
+
 export type UserTagGrants = Record<string, string[]>;
 
 export class AppError extends Error {
@@ -61,9 +65,12 @@ export function cleanFileName(name: string) {
   const cleaned = name
     .replace(/[\/\\]+/g, "_")
     .replace(/[\u0000-\u001f\u007f]+/g, "")
-    .trim();
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 180);
 
-  return cleaned || "untitled";
+  if (!cleaned || cleaned === "." || cleaned === "..") return "untitled";
+  return cleaned;
 }
 
 export function cleanDescription(value: unknown) {
@@ -115,6 +122,18 @@ export function parseOptionalDate(value: unknown) {
   return date.toISOString();
 }
 
+function cleanContentType(value: unknown) {
+  if (typeof value !== "string") return "application/octet-stream";
+  const normalized = value.trim().toLowerCase();
+  if (!/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+(?:\s*;\s*[a-z0-9!#$&^_.+-]+=[a-z0-9!#$&^_.+-]+)*$/.test(normalized)) {
+    return "application/octet-stream";
+  }
+  if (normalized === "text/html" || normalized === "application/xhtml+xml" || normalized === "image/svg+xml") {
+    return "application/octet-stream";
+  }
+  return normalized.slice(0, 120);
+}
+
 async function readJson<T>(storage: ObjectStorage, key: string): Promise<T | null> {
   const object = await storage.get(key);
   if (!object) return null;
@@ -142,7 +161,7 @@ function normalizeFileMeta(meta: Partial<DriveFileMeta> | null) {
     tags: cleanTags(meta.tags),
     owner: cleanOwner(meta.owner),
     size: typeof meta.size === "number" && Number.isFinite(meta.size) ? meta.size : 0,
-    contentType: typeof meta.contentType === "string" && meta.contentType ? meta.contentType : "application/octet-stream",
+    contentType: cleanContentType(meta.contentType),
     uploadedAt: typeof meta.uploadedAt === "string" ? meta.uploadedAt : new Date(0).toISOString(),
     expiresAt: typeof meta.expiresAt === "string" ? meta.expiresAt : null,
     lastDownloadedAt: typeof meta.lastDownloadedAt === "string" ? meta.lastDownloadedAt : null,
@@ -221,7 +240,7 @@ export async function createFileFromUpload(
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
   const name = cleanFileName(file.name);
-  const contentType = file.type || "application/octet-stream";
+  const contentType = cleanContentType(file.type);
 
   const meta: DriveFileMeta = {
     id,
@@ -351,9 +370,17 @@ export async function getUserTagGrants(storage: ObjectStorage) {
   return normalizeUserTagGrants(await readJson<UserTagGrants>(storage, PERMISSIONS_KEY));
 }
 
-export async function setUserVisibleTags(storage: ObjectStorage, user: string, tags: string[]) {
+export async function setUserVisibleTags(
+  storage: ObjectStorage,
+  user: string,
+  tags: string[],
+  options: SetUserVisibleTagsOptions = {},
+) {
   const normalizedUser = cleanOwner(user);
   if (!normalizedUser) throw new AppError("用户无效");
+  if (options.allowedUsers && !options.allowedUsers.includes(normalizedUser)) {
+    throw new AppError("只能为已配置的普通用户设置权限", 400);
+  }
 
   const grants = await getUserTagGrants(storage);
   grants[normalizedUser] = cleanTags(tags);
@@ -383,7 +410,53 @@ async function sha256Hex(input: string) {
 }
 
 async function hashPassword(code: string, password: string) {
-  return sha256Hex(`${code}:${password}`);
+  const salt = new Uint8Array(16);
+  crypto.getRandomValues(salt);
+  const iterations = 120_000;
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", encoder.encode(`${code}:${password}`), "PBKDF2", false, [
+    "deriveBits",
+  ]);
+  const bits = await crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      hash: "SHA-256",
+      salt,
+      iterations,
+    },
+    key,
+    256,
+  );
+
+  return `pbkdf2-sha256:${iterations}:${base64Url(salt)}:${base64Url(new Uint8Array(bits))}`;
+}
+
+function base64Url(bytes: Uint8Array) {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function base64UrlToBytes(value: string) {
+  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+function timingSafeBytesEqual(a: Uint8Array, b: Uint8Array) {
+  const length = Math.max(a.length, b.length);
+  let diff = a.length ^ b.length;
+  for (let index = 0; index < length; index += 1) {
+    diff |= (a[index] || 0) ^ (b[index] || 0);
+  }
+  return diff === 0;
 }
 
 export async function createShare(storage: ObjectStorage, input: CreateShareInput) {
@@ -404,7 +477,7 @@ export async function createShare(storage: ObjectStorage, input: CreateShareInpu
     code = randomShareCode();
   }
 
-  const password = input.password?.trim();
+  const password = input.password?.trim().slice(0, 256);
   const share: ShareRecord = {
     code,
     fileIds: activeFiles.map((file) => file.id),
@@ -433,7 +506,32 @@ export async function getShare(storage: ObjectStorage, code: string) {
 export async function verifySharePassword(share: ShareRecord, password: string | null | undefined) {
   if (!share.passwordHash) return true;
   if (!password) return false;
-  return (await hashPassword(share.code, password)) === share.passwordHash;
+
+  if (!share.passwordHash.startsWith("pbkdf2-sha256:")) {
+    return (await sha256Hex(`${share.code}:${password}`)) === share.passwordHash;
+  }
+
+  const [, iterationsValue, saltValue, hashValue] = share.passwordHash.split(":");
+  const iterations = Number(iterationsValue);
+  if (!Number.isSafeInteger(iterations) || iterations < 10_000 || !saltValue || !hashValue) return false;
+
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", encoder.encode(`${share.code}:${password}`), "PBKDF2", false, [
+    "deriveBits",
+  ]);
+  const expected = base64UrlToBytes(hashValue);
+  const bits = await crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      hash: "SHA-256",
+      salt: base64UrlToBytes(saltValue),
+      iterations,
+    },
+    key,
+    expected.length * 8,
+  );
+
+  return timingSafeBytesEqual(new Uint8Array(bits), expected);
 }
 
 export async function resolveShareFiles(storage: ObjectStorage, share: ShareRecord) {
