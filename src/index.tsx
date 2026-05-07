@@ -148,7 +148,14 @@ function errorResponse(message: string, status: number) {
 }
 
 function isUploadedFile(value: unknown): value is File {
-  return value instanceof File && value.size > 0;
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<File>;
+  const fileConstructor = (globalThis as typeof globalThis & { File?: typeof File }).File;
+  const isFile =
+    typeof fileConstructor === "function"
+      ? value instanceof fileConstructor
+      : value instanceof Blob && typeof candidate.name === "string";
+  return isFile && typeof candidate.size === "number" && candidate.size > 0;
 }
 
 function attachmentName(name: string) {
