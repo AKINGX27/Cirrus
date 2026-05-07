@@ -105,6 +105,14 @@ export interface UserPasswordCredential {
 
 export type UserPasswordCredentials = Record<string, UserPasswordCredential>;
 
+export interface StoredUserAccount {
+  name: string;
+  role: ManagedUserRole;
+  createdAt: string;
+}
+
+export type StoredUserAccounts = Record<string, StoredUserAccount>;
+
 export interface DirectMessage {
   id: string;
   from: string;
@@ -660,6 +668,36 @@ export async function getUserPasswordCredentials(storage: ObjectStorage) {
 
 export async function saveUserPasswordCredentials(storage: ObjectStorage, credentials: UserPasswordCredentials) {
   await writeJson(storage, USER_PASSWORDS_KEY, normalizeUserPasswordCredentials(credentials));
+}
+
+export function userAccountsFromCredentials(credentials: UserPasswordCredentials) {
+  const accounts: StoredUserAccounts = {};
+  for (const [user, credential] of Object.entries(credentials)) {
+    const normalizedUser = cleanUserName(user);
+    if (!normalizedUser) continue;
+    accounts[normalizedUser] = {
+      name: normalizedUser,
+      role: "user",
+      createdAt: credential.updatedAt,
+    };
+  }
+  return accounts;
+}
+
+export async function createRegisteredUser(storage: ObjectStorage, user: string, password: string, existingUsers: string[]) {
+  const normalizedUser = cleanUserName(user);
+  if (!normalizedUser) throw new AppError("用户名只能包含字母、数字、下划线、短横线和点号，长度 1-64 位");
+  if (existingUsers.map(cleanUserName).includes(normalizedUser)) throw new AppError("用户名已存在", 409);
+
+  const credentials = await getUserPasswordCredentials(storage);
+  if (credentials[normalizedUser]) throw new AppError("用户名已存在", 409);
+  credentials[normalizedUser] = {
+    passwordHash: await hashUserPassword(normalizedUser, password),
+    updatedAt: new Date().toISOString(),
+  };
+  await saveUserPasswordCredentials(storage, credentials);
+  await ensureUserProfiles(storage, [normalizedUser]);
+  return userAccountsFromCredentials(credentials)[normalizedUser];
 }
 
 function nicknameOwner(profiles: UserProfiles, nickname: string, currentUser: string) {

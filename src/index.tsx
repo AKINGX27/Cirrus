@@ -6,6 +6,7 @@ import {
   AppError,
   copyFiles,
   createFileFromUpload,
+  createRegisteredUser,
   createShare,
   deleteDriveFile,
   getActiveFileMeta,
@@ -35,10 +36,12 @@ import {
   updateFileTags,
   verifySharePassword,
   verifyUserPasswordHash,
+  userAccountsFromCredentials,
   type CreateShareInput,
   type DirectMessage,
   type DriveFileMeta,
   type MergeMode,
+  type StoredUserAccount,
   type UserPasswordCredentials,
   type UserTagGrants,
   type UserProfiles,
@@ -66,6 +69,7 @@ interface AuthUser {
   name: string;
   password: string;
   role: UserRole;
+  source: "env" | "registered";
 }
 
 interface AuthSession {
@@ -95,6 +99,8 @@ const DEFAULT_MAX_SHARE_FILES = 100;
 const DEFAULT_API_RATE_LIMIT_PER_MINUTE = 300;
 const DEFAULT_AUTH_RATE_LIMIT_PER_MINUTE = 60;
 const DEFAULT_SHARE_VERIFY_RATE_LIMIT_PER_MINUTE = 30;
+const SESSION_COOKIE = "cirrus_session";
+const SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 14;
 
 interface RateBucket {
   count: number;
@@ -197,6 +203,17 @@ function base64Url(bytes: Uint8Array) {
     binary += String.fromCharCode(byte);
   }
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function base64UrlToBytes(value: string) {
+  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
 }
 
 function parseContentLength(value: string | null) {
@@ -331,10 +348,66 @@ async function sha256Bytes(input: string) {
   return new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
 }
 
+async function hmacSha256Base64Url(secret: string, input: string) {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, [
+    "sign",
+  ]);
+  return base64Url(new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(input))));
+}
+
+function sessionSecret(env: Bindings) {
+  return env.CSRF_SECRET?.trim() || env.AUTH_USERS?.trim() || "cirrus-dev-session-secret";
+}
+
 async function csrfTokenForSession(env: Bindings, session: AuthSession) {
-  const secret = env.CSRF_SECRET?.trim() || env.AUTH_USERS?.trim() || "cirrus-dev-csrf-secret";
+  const secret = sessionSecret(env);
   const bytes = await sha256Bytes(`${secret}:${session.name}:${session.role}`);
   return base64Url(bytes);
+}
+
+function parseCookies(request: Request) {
+  const cookies = new Map<string, string>();
+  const header = request.headers.get("Cookie") || "";
+  for (const part of header.split(";")) {
+    const [rawName, ...rawValue] = part.trim().split("=");
+    if (!rawName) continue;
+    cookies.set(rawName, rawValue.join("="));
+  }
+  return cookies;
+}
+
+async function createSessionCookieValue(env: Bindings, session: AuthSession) {
+  const payload = base64Url(new TextEncoder().encode(JSON.stringify({ user: session.name, createdAt: Date.now() })));
+  const signature = await hmacSha256Base64Url(sessionSecret(env), payload);
+  return `${payload}.${signature}`;
+}
+
+async function verifySessionCookie(request: Request, env: Bindings) {
+  const value = parseCookies(request).get(SESSION_COOKIE);
+  if (!value) return "";
+  const [payload, signature] = value.split(".");
+  if (!payload || !signature) return "";
+  const expected = await hmacSha256Base64Url(sessionSecret(env), payload);
+  if (!timingSafeEqual(signature, expected)) return "";
+
+  let data: { user?: unknown; createdAt?: unknown };
+  try {
+    data = JSON.parse(new TextDecoder().decode(base64UrlToBytes(payload)));
+  } catch {
+    return "";
+  }
+  if (typeof data.user !== "string" || typeof data.createdAt !== "number") return "";
+  if (Date.now() - data.createdAt > SESSION_MAX_AGE_SECONDS * 1000) return "";
+  return data.user;
+}
+
+function sessionCookieHeader(value: string) {
+  return `${SESSION_COOKIE}=${value}; Max-Age=${SESSION_MAX_AGE_SECONDS}; Path=/; HttpOnly; SameSite=Lax; Secure`;
+}
+
+function clearSessionCookieHeader() {
+  return `${SESSION_COOKIE}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax; Secure`;
 }
 
 function safeResponseHeaders(nonce: string) {
@@ -380,7 +453,7 @@ function parseAuthUsers(value: string | undefined) {
 
     if (!name || !password || !/^[A-Za-z0-9_.-]{1,64}$/.test(name) || seen.has(name)) continue;
     seen.add(name);
-    users.push({ name, password, role });
+    users.push({ name, password, role, source: "env" });
   }
 
   return users;
@@ -388,6 +461,22 @@ function parseAuthUsers(value: string | undefined) {
 
 function authUsers(env: Bindings) {
   return parseAuthUsers(env.AUTH_USERS);
+}
+
+async function allAuthUsers(env: Bindings, storage?: ObjectStorage) {
+  const users = authUsers(env);
+  const seen = new Set(users.map((user) => user.name));
+  const objectStorage = storage || createObjectStorage(env);
+  const credentials = await getUserPasswordCredentials(objectStorage).catch(() => ({} as UserPasswordCredentials));
+  const accounts = userAccountsFromCredentials(credentials);
+
+  for (const account of Object.values(accounts)) {
+    if (seen.has(account.name)) continue;
+    seen.add(account.name);
+    users.push({ name: account.name, password: "", role: account.role, source: "registered" });
+  }
+
+  return users;
 }
 
 function timingSafeEqual(a: string, b: string) {
@@ -405,24 +494,46 @@ function timingSafeEqual(a: string, b: string) {
 }
 
 function unauthorizedResponse() {
-  return new Response("Authentication required", {
-    status: 401,
-    headers: {
-      "WWW-Authenticate": 'Basic realm="Cirrus Drive", charset="UTF-8"',
+  return Response.json(
+    { error: "请先登录" },
+    {
+      status: 401,
+      headers: {
+        "Cache-Control": "no-store",
+      },
     },
-  });
+  );
 }
 
-async function authenticate(request: Request, env: Bindings): Promise<AuthSession | null> {
-  const users = authUsers(env);
-  if (!users.length) {
-    if (!truthyEnv(env.ALLOW_UNCONFIGURED_AUTH) && !isLocalRequest(request)) return null;
-    return { name: "admin", role: "admin", baseRole: "admin", configured: false };
-  }
+async function sessionForUserName(userName: string, env: Bindings, storage: ObjectStorage) {
+  const users = await allAuthUsers(env, storage);
+  const user = users.find((item) => item.name === userName);
+  if (!user) return null;
+  const profiles = await getUserProfiles(storage).catch(() => ({} as UserProfiles));
+  const role = profiles[user.name]?.role || user.role;
+  return { name: user.name, role, baseRole: user.role, configured: true } satisfies AuthSession;
+}
 
+async function authenticateCredentials(userName: string, password: string, env: Bindings, storage: ObjectStorage) {
+  const users = await allAuthUsers(env, storage);
+  const user = users.find((item) => item.name === userName);
+  if (!user) return null;
+
+  const credentials = await getUserPasswordCredentials(storage).catch(() => ({} as UserPasswordCredentials));
+  const credential = credentials[user.name];
+  const passwordMatches = credential
+    ? await verifyUserPasswordHash(user.name, credential.passwordHash, password)
+    : user.source === "env" && timingSafeEqual(user.password, password);
+  if (!passwordMatches) return null;
+
+  const profiles = await getUserProfiles(storage).catch(() => ({} as UserProfiles));
+  const role = profiles[user.name]?.role || user.role;
+  return { name: user.name, role, baseRole: user.role, configured: true } satisfies AuthSession;
+}
+
+function legacyBasicCredentials(request: Request) {
   const header = request.headers.get("Authorization") || "";
   if (!header.startsWith("Basic ")) return null;
-
   let decoded = "";
   try {
     decoded = atob(header.slice(6));
@@ -432,23 +543,50 @@ async function authenticate(request: Request, env: Bindings): Promise<AuthSessio
 
   const separator = decoded.indexOf(":");
   if (separator < 0) return null;
+  return {
+    name: decoded.slice(0, separator),
+    password: decoded.slice(separator + 1),
+  };
+}
 
-  const name = decoded.slice(0, separator);
-  const password = decoded.slice(separator + 1);
-  const user = users.find((item) => item.name === name);
-  if (!user) return null;
+function htmlUnauthorizedResponse(nonce: string, csrfToken: string) {
+  const html = `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf-token" content="${csrfToken}">
+<title>Cirrus Drive</title>
+<style nonce="${nonce}">${styles}</style>
+</head>
+<body>${renderAuthShellHtml(nonce)}</body>
+</html>`;
+  return new Response(html, {
+    status: 401,
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+    },
+  });
+}
 
+async function authenticate(request: Request, env: Bindings): Promise<AuthSession | null> {
   const storage = createObjectStorage(env);
+  const configuredUsers = authUsers(env);
   const credentials = await getUserPasswordCredentials(storage).catch(() => ({} as UserPasswordCredentials));
-  const credential = credentials[user.name];
-  const passwordMatches = credential
-    ? await verifyUserPasswordHash(user.name, credential.passwordHash, password)
-    : timingSafeEqual(user.password, password);
-  if (!passwordMatches) return null;
+  if (!configuredUsers.length && !Object.keys(credentials).length) {
+    if (!truthyEnv(env.ALLOW_UNCONFIGURED_AUTH) && !isLocalRequest(request)) return null;
+    return { name: "admin", role: "admin", baseRole: "admin", configured: false };
+  }
 
-  const profiles = await getUserProfiles(storage).catch(() => ({} as UserProfiles));
-  const role = profiles[user.name]?.role || user.role;
-  return { name: user.name, role, baseRole: user.role, configured: true };
+  const cookieUser = await verifySessionCookie(request, env);
+  if (cookieUser) {
+    const session = await sessionForUserName(cookieUser, env, storage);
+    if (session) return session;
+  }
+
+  const basic = legacyBasicCredentials(request);
+  return basic ? authenticateCredentials(basic.name, basic.password, env, storage) : null;
 }
 
 function isLocalRequest(request: Request) {
@@ -529,6 +667,14 @@ function allUserNamesFromEnv(env: Bindings) {
   return authUsers(env).map((user) => user.name);
 }
 
+async function userNamesForAdmin(env: Bindings, storage: ObjectStorage) {
+  return (await allAuthUsers(env, storage)).filter((user) => user.role !== "admin").map((user) => user.name);
+}
+
+async function allUserNames(env: Bindings, storage: ObjectStorage) {
+  return (await allAuthUsers(env, storage)).map((user) => user.name);
+}
+
 function knownTags(files: DriveFileMeta[], grants: UserTagGrants) {
   const tags = new Map<string, string>();
 
@@ -599,6 +745,49 @@ function messageForClient(message: DirectMessage, files: Map<string, DriveFileMe
       .filter((file): file is DriveFileMeta => Boolean(file))
       .map(fileForClient),
   };
+}
+
+function renderAuthShellHtml(nonce: string) {
+  return `<main class="app-shell auth-required-shell" data-app="auth" data-role="" data-user="" data-auth-required="true">
+  <aside class="side-rail">
+    <a class="brand" href="/" aria-label="Cirrus Drive">
+      <span class="brand-mark">C</span>
+      <span><strong>Cirrus</strong><small>Cloud Drive</small></span>
+    </a>
+    <div class="storage-card">
+      <span>需要登录</span>
+      <strong>欢迎回来</strong>
+      <small>登录或注册后继续</small>
+    </div>
+  </aside>
+  <section class="workspace">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Personal Cloud</p>
+        <h1>文件</h1>
+      </div>
+    </header>
+    <section class="file-surface" aria-label="文件列表">
+      <div class="empty-state"><strong>请先登录</strong><span>登录后会显示你的文件和好友消息。</span></div>
+    </section>
+  </section>
+  <dialog id="auth-dialog" class="modal auth-modal">
+    <form method="dialog" class="modal-panel" id="auth-form">
+      <header>
+        <h2 id="auth-title">登录</h2>
+      </header>
+      <label><span>用户名</span><input id="auth-username" autocomplete="username" autofocus /></label>
+      <label><span>密码</span><input id="auth-password" type="password" autocomplete="current-password" /></label>
+      <label id="auth-confirm-row" hidden><span>确认密码</span><input id="auth-confirm-password" type="password" autocomplete="new-password" /></label>
+      <output id="auth-status"></output>
+      <footer>
+        <button id="auth-mode-button" type="button">注册账号</button>
+        <button id="auth-submit-button" value="default">登录</button>
+      </footer>
+    </form>
+  </dialog>
+  <script nonce="${nonce}">${authClientScript}</script>
+</main>`;
 }
 
 async function zipResponse(storage: ObjectStorage, files: DriveFileMeta[], archiveName: string) {
@@ -709,10 +898,11 @@ app.use("/api/*", async (c, next) => {
   const isPublicShareRead = c.req.method === "GET" && /^\/api\/shares\/[^/]+$/.test(path);
   const isPublicShareVerify = c.req.method === "POST" && /^\/api\/shares\/[^/]+\/verify$/.test(path);
   const isPublicShareDownload = c.req.method === "POST" && /^\/api\/shares\/[^/]+\/download$/.test(path);
+  const isAuthEndpoint = c.req.method === "POST" && /^\/api\/auth\/(?:login|register|logout)$/.test(path);
   if (isPublicShareVerify && !consumeRateLimit(`share-verify:${clientKey}:${path}`, shareVerifyRateLimit(c.env))) {
     return rateLimitResponse();
   }
-  if (isPublicShareRead || isPublicShareVerify || isPublicShareDownload) {
+  if (isPublicShareRead || isPublicShareVerify || isPublicShareDownload || isAuthEndpoint) {
     await next();
     return;
   }
@@ -738,7 +928,7 @@ app.get("/", async (c) => {
     return rateLimitResponse();
   }
   const session = await authenticate(c.req.raw, c.env);
-  if (!session) return unauthorizedResponse();
+  if (!session) return htmlUnauthorizedResponse(c.get("nonce"), "");
   c.set("csrfToken", await csrfTokenForSession(c.env, session));
   return c.render(<DriveApp storageName={storageLabel(c.env)} session={session} nonce={c.get("nonce")} />);
 });
@@ -759,6 +949,55 @@ app.get("/s/:code", (c) => {
   return c.render(<ShareApp code={code} nonce={c.get("nonce")} />);
 });
 
+app.post("/api/auth/login", async (c) => {
+  try {
+    const body = await jsonBody<{ username?: unknown; password?: unknown }>(c.req.raw, maxJsonBytes(c.env));
+    const username = typeof body.username === "string" ? body.username : "";
+    const password = typeof body.password === "string" ? body.password : "";
+    const storage = createObjectStorage(c.env);
+    const session = await authenticateCredentials(username, password, c.env, storage);
+    if (!session) throw new AppError("用户名或密码不正确", 401);
+
+    const cookie = await createSessionCookieValue(c.env, session);
+    c.header("Set-Cookie", sessionCookieHeader(cookie));
+    return c.json({ user: { name: session.name, role: session.role }, csrfToken: await csrfTokenForSession(c.env, session) });
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
+
+app.post("/api/auth/register", async (c) => {
+  try {
+    const body = await jsonBody<{ username?: unknown; password?: unknown; confirmPassword?: unknown }>(
+      c.req.raw,
+      maxJsonBytes(c.env),
+    );
+    const username = typeof body.username === "string" ? body.username : "";
+    const password = typeof body.password === "string" ? body.password : "";
+    const confirmPassword = typeof body.confirmPassword === "string" ? body.confirmPassword : "";
+    if (password !== confirmPassword) throw new AppError("两次输入的密码不一致");
+
+    const storage = createObjectStorage(c.env);
+    const existing = authUsers(c.env).map((user) => user.name);
+    const account = await createRegisteredUser(storage, username, password, existing);
+    const session = await sessionForUserName(account.name, c.env, storage);
+    if (!session) throw new AppError("注册失败", 500);
+
+    const cookie = await createSessionCookieValue(c.env, session);
+    c.header("Set-Cookie", sessionCookieHeader(cookie));
+    return c.json({ user: { name: session.name, role: session.role }, csrfToken: await csrfTokenForSession(c.env, session) }, 201);
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
+
+app.post("/api/auth/logout", (c) => {
+  c.header("Set-Cookie", clearSessionCookieHeader());
+  return c.json({ ok: true });
+});
+
 app.get("/api/files", async (c) => {
   const storage = createObjectStorage(c.env);
   const files = filterFiles(await visibleFiles(storage, c.get("session")), c.req.query("q"), c.req.query("tag"));
@@ -770,10 +1009,11 @@ app.get("/api/me", async (c) => {
     const storage = createObjectStorage(c.env);
     const profiles = await getUserProfiles(storage);
     const session = c.get("session");
-    const user = authUsers(c.env).find((item) => item.name === session.name) || {
+    const user = (await allAuthUsers(c.env, storage)).find((item) => item.name === session.name) || {
       name: session.name,
       password: "",
       role: session.baseRole,
+      source: "registered" as const,
     };
 
     return c.json({
@@ -800,7 +1040,7 @@ app.patch("/api/me/profile", async (c) => {
       newPassword?: unknown;
     }>(c.req.raw, maxJsonBytes(c.env));
     const storage = createObjectStorage(c.env);
-    const allowedUsers = allUserNamesFromEnv(c.env);
+    const allowedUsers = await allUserNames(c.env, storage);
     const profile = await updateOwnUserProfile(storage, c.get("session").name, {
       nickname: body.nickname,
       avatar: body.avatar,
@@ -812,7 +1052,7 @@ app.patch("/api/me/profile", async (c) => {
     if (body.newPassword !== undefined && String(body.newPassword || "").trim()) {
       const currentPassword = typeof body.currentPassword === "string" ? body.currentPassword : "";
       const newPassword = typeof body.newPassword === "string" ? body.newPassword : "";
-      const currentUser = authUsers(c.env).find((user) => user.name === c.get("session").name);
+      const currentUser = (await allAuthUsers(c.env, storage)).find((user) => user.name === c.get("session").name);
       if (!currentUser) throw new AppError("用户不存在", 404);
 
       const credentials = await getUserPasswordCredentials(storage);
@@ -841,7 +1081,7 @@ app.get("/api/users/search", async (c) => {
     const storage = createObjectStorage(c.env);
     const profiles = await getUserProfiles(storage);
     const currentUser = c.get("session").name;
-    const users = authUsers(c.env)
+    const users = (await allAuthUsers(c.env, storage))
       .filter((user) => user.name !== currentUser)
       .filter((user) => {
         const profile = profiles[user.name];
@@ -866,7 +1106,7 @@ app.get("/api/friends", async (c) => {
   try {
     const storage = createObjectStorage(c.env);
     const profiles = await getUserProfiles(storage);
-    const users = new Map(authUsers(c.env).map((user) => [user.name, user]));
+    const users = new Map((await allAuthUsers(c.env, storage)).map((user) => [user.name, user]));
     const current = profiles[c.get("session").name];
     const friends = (current?.friends || [])
       .map((name) => users.get(name))
@@ -882,8 +1122,9 @@ app.get("/api/friends", async (c) => {
 app.post("/api/friends/:user", async (c) => {
   try {
     const storage = createObjectStorage(c.env);
-    const profiles = await addFriend(storage, c.get("session").name, c.req.param("user"), allUserNamesFromEnv(c.env));
-    const target = authUsers(c.env).find((user) => user.name === c.req.param("user"));
+    const allowedUsers = await allUserNames(c.env, storage);
+    const profiles = await addFriend(storage, c.get("session").name, c.req.param("user"), allowedUsers);
+    const target = (await allAuthUsers(c.env, storage)).find((user) => user.name === c.req.param("user"));
     if (!target) throw new AppError("用户不存在", 404);
     return c.json({ friend: userProfileForClient(target, profiles, c.get("session").name) });
   } catch (error) {
@@ -895,7 +1136,7 @@ app.post("/api/friends/:user", async (c) => {
 app.delete("/api/friends/:user", async (c) => {
   try {
     const storage = createObjectStorage(c.env);
-    await removeFriend(storage, c.get("session").name, c.req.param("user"), allUserNamesFromEnv(c.env));
+    await removeFriend(storage, c.get("session").name, c.req.param("user"), await allUserNames(c.env, storage));
     return c.json({ ok: true });
   } catch (error) {
     const { message, status } = jsonError(error);
@@ -906,7 +1147,7 @@ app.delete("/api/friends/:user", async (c) => {
 app.get("/api/messages/:user", async (c) => {
   try {
     const storage = createObjectStorage(c.env);
-    const messages = await getDirectMessages(storage, c.get("session").name, c.req.param("user"), allUserNamesFromEnv(c.env));
+    const messages = await getDirectMessages(storage, c.get("session").name, c.req.param("user"), await allUserNames(c.env, storage));
     const allowedFiles = new Map((await visibleFiles(storage, c.get("session"))).map((file) => [file.id, file]));
     return c.json({ messages: messages.map((message) => messageForClient(message, allowedFiles)) });
   } catch (error) {
@@ -934,7 +1175,7 @@ app.post("/api/messages/:user", async (c) => {
         users: [c.req.param("user")],
         visibleFileIds: fileIds,
         visibleFileMode: "add",
-        allowedUsers: allUserNamesFromEnv(c.env),
+        allowedUsers: await allUserNames(c.env, storage),
       });
     }
 
@@ -943,7 +1184,7 @@ app.post("/api/messages/:user", async (c) => {
       to: c.req.param("user"),
       message: body.message,
       fileIds,
-      allowedUsers: allUserNamesFromEnv(c.env),
+      allowedUsers: await allUserNames(c.env, storage),
     });
     const files = new Map((await visibleFiles(storage, c.get("session"))).map((file) => [file.id, file]));
     return c.json({ message: messageForClient(message, files) }, 201);
@@ -1261,7 +1502,7 @@ app.get("/api/admin/permissions", async (c) => {
     const grants = await getUserTagGrants(storage);
 
     return c.json({
-      users: userNamesFromEnv(c.env),
+      users: await userNamesForAdmin(c.env, storage),
       grants,
       tags: knownTags(files, grants),
     });
@@ -1277,7 +1518,7 @@ app.patch("/api/admin/permissions/:user", async (c) => {
     const body = await jsonBody<{ tags?: unknown }>(c.req.raw, maxJsonBytes(c.env));
     const storage = createObjectStorage(c.env);
     const tags = await setUserVisibleTags(storage, c.req.param("user"), cleanTags(body.tags), {
-      allowedUsers: userNamesFromEnv(c.env),
+      allowedUsers: await userNamesForAdmin(c.env, storage),
     });
 
     return c.json({ user: c.req.param("user"), tags });
@@ -1294,7 +1535,7 @@ app.get("/api/admin/overview", async (c) => {
     const files = await listFiles(storage);
     const grants = await getUserTagGrants(storage);
     const profiles = await getUserProfiles(storage);
-    const users = authUsers(c.env);
+    const users = await allAuthUsers(c.env, storage);
 
     return c.json({
       users: users.map((user) => userSummary(user, profiles, files, grants)),
@@ -1324,7 +1565,7 @@ app.post("/api/admin/users/batch", async (c) => {
     }>(c.req.raw, maxJsonBytes(c.env));
 
     const storage = createObjectStorage(c.env);
-    const allowedUsers = allUserNamesFromEnv(c.env);
+    const allowedUsers = await allUserNames(c.env, storage);
     const users = Array.isArray(body.users) ? body.users.filter((user): user is string => typeof user === "string") : [];
     const role: UserRole | null | undefined =
       body.role === "admin" || body.role === "user" || body.role === null ? body.role : undefined;
@@ -1376,7 +1617,7 @@ app.post("/api/admin/users/batch", async (c) => {
 
     const files = await listFiles(storage);
     return c.json({
-      users: authUsers(c.env).map((user) => userSummary(user, profiles, files, grants)),
+      users: (await allAuthUsers(c.env, storage)).map((user) => userSummary(user, profiles, files, grants)),
       grants,
     });
   } catch (error) {
@@ -1415,6 +1656,9 @@ function DriveApp({ storageName, session, nonce }: { storageName: string; sessio
           </button>
           <button class="nav-item" type="button" data-action="friends">
             <span>好友私信</span>
+          </button>
+          <button class="nav-item" type="button" data-action="logout">
+            <span>退出登录</span>
           </button>
           <button class="nav-item" type="button" data-action="refresh">
             <span>刷新列表</span>
@@ -2440,8 +2684,16 @@ button.tag-chip {
   width: min(520px, calc(100vw - 28px));
 }
 
+.auth-modal {
+  width: min(420px, calc(100vw - 28px));
+}
+
 .friends-modal {
   width: min(980px, calc(100vw - 28px));
+}
+
+.auth-required-shell .file-surface {
+  min-height: 360px;
 }
 
 .profile-preview {
@@ -2913,6 +3165,7 @@ const clientScript = String.raw`
   const markNotificationsRead = document.getElementById("mark-notifications-read");
   const profileButton = document.querySelector('[data-action="profile"]');
   const friendsButton = document.querySelector('[data-action="friends"]');
+  const logoutButton = document.querySelector('[data-action="logout"]');
   const profileDialog = document.getElementById("profile-dialog");
   const profileForm = document.getElementById("profile-form");
   const profileNickname = document.getElementById("profile-nickname");
@@ -2973,6 +3226,7 @@ const clientScript = String.raw`
 
     const response = await fetch(path, {
       ...options,
+      credentials: "same-origin",
       headers
     });
 
@@ -2986,6 +3240,14 @@ const clientScript = String.raw`
     }
 
     return response.json();
+  }
+
+  async function logout() {
+    await api("/api/auth/logout", {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    location.reload();
   }
 
   function formatDate(value) {
@@ -3608,6 +3870,7 @@ const clientScript = String.raw`
     notify("正在打包 " + ids.length + " 个文件...");
     const response = await fetch("/api/files/download", {
       method: "POST",
+      credentials: "same-origin",
       headers: {
         "Content-Type": "application/json",
         "X-CSRF-Token": csrfToken
@@ -3892,6 +4155,7 @@ const clientScript = String.raw`
     profileAvatar.value = "";
   }));
   friendsButton.addEventListener("click", () => openFriendsDialog().catch((error) => notify(error.message, "error")));
+  logoutButton.addEventListener("click", () => logout().catch((error) => notify(error.message, "error")));
   let friendSearchTimer = 0;
   friendSearch.addEventListener("input", () => {
     window.clearTimeout(friendSearchTimer);
@@ -3942,6 +4206,69 @@ const clientScript = String.raw`
 })();
 `;
 
+const authClientScript = String.raw`
+(() => {
+  const dialog = document.getElementById("auth-dialog");
+  const form = document.getElementById("auth-form");
+  const title = document.getElementById("auth-title");
+  const username = document.getElementById("auth-username");
+  const password = document.getElementById("auth-password");
+  const confirmRow = document.getElementById("auth-confirm-row");
+  const confirmPassword = document.getElementById("auth-confirm-password");
+  const status = document.getElementById("auth-status");
+  const modeButton = document.getElementById("auth-mode-button");
+  const submitButton = document.getElementById("auth-submit-button");
+  let mode = "login";
+
+  function setMode(nextMode) {
+    mode = nextMode;
+    const isRegister = mode === "register";
+    title.textContent = isRegister ? "注册" : "登录";
+    confirmRow.hidden = !isRegister;
+    modeButton.textContent = isRegister ? "返回登录" : "注册账号";
+    submitButton.textContent = isRegister ? "注册并登录" : "登录";
+    password.autocomplete = isRegister ? "new-password" : "current-password";
+    status.value = "";
+  }
+
+  async function submit(event) {
+    event.preventDefault();
+    const body = {
+      username: username.value.trim(),
+      password: password.value
+    };
+    if (mode === "register") {
+      body.confirmPassword = confirmPassword.value;
+      if (body.password !== body.confirmPassword) {
+        status.value = "两次输入的密码不一致";
+        return;
+      }
+    }
+
+    status.value = mode === "register" ? "正在注册..." : "正在登录...";
+    const response = await fetch(mode === "register" ? "/api/auth/register" : "/api/auth/login", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      status.value = data.error || "请求失败";
+      return;
+    }
+    location.reload();
+  }
+
+  modeButton.addEventListener("click", () => setMode(mode === "login" ? "register" : "login"));
+  form.addEventListener("submit", (event) => submit(event).catch((error) => {
+    status.value = error.message;
+  }));
+  setMode("login");
+  dialog.showModal();
+})();
+`;
+
 const adminClientScript = String.raw`
 (() => {
   const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || "";
@@ -3975,6 +4302,7 @@ const adminClientScript = String.raw`
     const method = (options.method || "GET").toUpperCase();
     const response = await fetch(path, {
       ...options,
+      credentials: "same-origin",
       headers: {
         ...(options.body ? { "Content-Type": "application/json" } : {}),
         ...(method === "GET" ? {} : { "X-CSRF-Token": csrfToken }),

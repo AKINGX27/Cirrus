@@ -11,7 +11,7 @@
 - 搜索支持文件名、标签、描述字段和扩展名
 - 点击标签可筛选同标签文件
 - 右键菜单支持改名、修改描述、修改标签、下载、选择、复制、剪切、分享
-- Basic Auth 权限管理：普通用户默认只看自己的文件，管理员可看全部文件并为普通用户授权可见标签
+- 应用内登录和注册：未登录时显示登录弹窗，普通用户默认只看自己的文件
 - 管理页面支持批量提权、恢复角色、添加用户标签、设置可见标签、设置可见文件和发送通知
 - 用户可在账号设置中修改密码、唯一昵称、头像和状态，按用户名、昵称、用户标签搜索其他用户
 - 好友之间可发送私信，也可把自己可见的文件发送给好友
@@ -113,7 +113,7 @@ R2 配置说明：
 
 ### 4. 登录和权限配置
 
-项目使用 Workers 原生 Basic Auth，不需要额外数据库。建议在 Cloudflare Dashboard 的 Worker `Settings` -> `Variables and Secrets` 里把 `AUTH_USERS` 和 `CSRF_SECRET` 设置为 Secret：
+项目使用应用内登录弹窗和安全 Cookie 会话，不依赖浏览器原生 Basic Auth 弹窗。建议在 Cloudflare Dashboard 的 Worker `Settings` -> `Variables and Secrets` 里把 `AUTH_USERS` 和 `CSRF_SECRET` 设置为 Secret：
 
 ```text
 admin:change-me:admin,alice:alice-password:user,bob:bob-password:user
@@ -132,9 +132,9 @@ admin:change-me:admin,alice:alice-password:user,bob:bob-password:user
 | `admin` | 最高权限，可看所有文件，可修改所有文件，可进入权限管理 |
 | `user` | 默认只能看自己上传的文件；管理员授权后，也能看到匹配授权标签的其他文件 |
 
-如果不配置 `AUTH_USERS`，项目会以未配置状态运行，并自动视为 `admin` 用户。这适合首次试用，但公开部署时应配置真实账号。
+`AUTH_USERS` 用于预置初始账号，尤其建议至少预置一个管理员账号。普通用户也可以在未登录弹窗中注册，注册账号默认是 `user` 角色，密码哈希会写入对象存储。
 
-公开部署时必须配置 `AUTH_USERS`。没有配置账号时，生产域名会拒绝登录；只有 `localhost` 本地开发会自动启用未配置管理员模式。如确实需要临时开放，可设置 `ALLOW_UNCONFIGURED_AUTH=true`，但不建议用于公网。
+如果不配置 `AUTH_USERS`，项目会以未配置状态运行，并自动视为 `admin` 用户。这适合首次试用，但公开部署时应配置真实管理员账号。没有配置账号时，生产域名会拒绝进入管理模式；只有 `localhost` 本地开发会自动启用未配置管理员模式。如确实需要临时开放，可设置 `ALLOW_UNCONFIGURED_AUTH=true`，但不建议用于公网。
 
 `CSRF_SECRET` 用于生成每个登录用户的 CSRF token，应设置为随机长字符串。它不会暴露给前端，前端只会拿到派生后的 token。
 
@@ -145,7 +145,7 @@ admin:change-me:admin,alice:alice-password:user,bob:bob-password:user
 | `AUTH_USERS` | `admin:change-me:admin,alice:alice-password:user` | 登录账号、密码和初始角色 |
 | `CSRF_SECRET` | `openssl rand -base64 32` 生成的随机值 | 写操作 CSRF 防护 |
 
-用户名称建议只使用字母、数字、下划线、短横线和点号。Basic Auth 密码不要包含英文逗号或冒号，因为 `AUTH_USERS` 使用逗号和冒号分隔。
+用户名称只支持字母、数字、下划线、短横线和点号。写在 `AUTH_USERS` 中的初始密码不要包含英文逗号或冒号，因为 `AUTH_USERS` 使用逗号和冒号分隔。
 
 管理员登录后，左侧会显示 `权限管理`，进入 `/admin` 后可以批量管理用户：
 
@@ -157,7 +157,7 @@ admin:change-me:admin,alice:alice-password:user,bob:bob-password:user
 | 可见文件 | 允许用户看到被指定的单个文件，适合临时授权少量文件 |
 | 发送通知 | 给所选用户发送站内通知；用户首页左侧 `通知` 中可查看和标为已读 |
 
-`AUTH_USERS` 仍然是账号和密码来源。管理页面不会创建登录密码，也不会删除账号；新增用户仍需先把账号写进 `AUTH_USERS`。管理页面写入的提权、用户标签、可见文件和通知会保存到对象存储中的 `permissions/user-profiles.json`。可见标签授权会保存到 `permissions/tag-grants.json`。
+`AUTH_USERS` 是预置账号来源；注册用户和用户修改后的密码哈希会保存到 `accounts/passwords.json`。管理页面不会删除账号；管理页面写入的提权、用户标签、可见文件和通知会保存到对象存储中的 `permissions/user-profiles.json`。可见标签授权会保存到 `permissions/tag-grants.json`。
 
 在管理页面里设置 `可见标签`，例如：
 
@@ -184,7 +184,7 @@ admin:change-me:admin,alice:alice-password:user,bob:bob-password:user
 | 私信 | 只能给好友发送私信 |
 | 分享文件给好友 | 在好友私信中附带自己可见的文件；发送后对方会获得该文件的指定可见权限 |
 
-好友、昵称、头像、状态、指定可见文件和通知都存放在 `permissions/user-profiles.json`。修改后的密码哈希存放在 `accounts/passwords.json`；`AUTH_USERS` 仍然是账号来源和初始密码来源。私信记录按会话存放在 `messages/` 前缀下。文件对象本身不会复制，好友收到的是对原文件的可见授权。
+好友、昵称、头像、状态、指定可见文件和通知都存放在 `permissions/user-profiles.json`。注册用户和修改后的密码哈希存放在 `accounts/passwords.json`；`AUTH_USERS` 仍然是预置账号和初始密码来源。私信记录按会话存放在 `messages/` 前缀下。文件对象本身不会复制，好友收到的是对原文件的可见授权。
 
 ### 6. 安全防护配置
 
