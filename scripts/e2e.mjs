@@ -295,6 +295,16 @@ test("registered users, profile settings, permissions, files, sharing, friends, 
     const adminMe = await app.api("/api/me", admin);
     assert.equal(adminMe.user.role, "admin");
 
+    const invalidUserName = await app.request("/api/auth/register", {
+      method: "POST",
+      json: {
+        username: "bad user space",
+        password: "Password123!",
+        confirmPassword: "Password123!",
+      },
+    });
+    await expectJson(invalidUserName, 400, "invalid username rejected before storage write");
+
     const user = await app.register("alice", "UserPass123!");
     assert.equal(user.user.role, "user", "second registered user should be normal user");
     const normalUser = await app.login("alice", "UserPass123!");

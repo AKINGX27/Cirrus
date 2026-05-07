@@ -7,6 +7,7 @@ const DIRECT_MESSAGES_PREFIX = "messages/";
 const PERMISSIONS_KEY = "permissions/tag-grants.json";
 const USER_PROFILES_KEY = "permissions/user-profiles.json";
 const USER_PASSWORDS_KEY = "accounts/passwords.json";
+const PASSWORD_HASH_ITERATIONS = 100_000;
 
 export interface DriveFileMeta {
   id: string;
@@ -224,8 +225,9 @@ function cleanOwner(value: unknown) {
 }
 
 export function cleanUserName(value: unknown) {
-  const owner = cleanOwner(value);
-  return /^[A-Za-z0-9_.-]{1,64}$/.test(owner) ? owner : "";
+  if (typeof value !== "string") return "";
+  const user = value.trim();
+  return /^[A-Za-z0-9_.-]{1,64}$/.test(user) ? user : "";
 }
 
 function cleanRole(value: unknown): ManagedUserRole | null {
@@ -1025,7 +1027,7 @@ async function sha256Hex(input: string) {
 async function hashPassword(code: string, password: string) {
   const salt = new Uint8Array(16);
   crypto.getRandomValues(salt);
-  const iterations = 120_000;
+  const iterations = PASSWORD_HASH_ITERATIONS;
   const encoder = new TextEncoder();
   const key = await crypto.subtle.importKey("raw", encoder.encode(`${code}:${password}`), "PBKDF2", false, [
     "deriveBits",
