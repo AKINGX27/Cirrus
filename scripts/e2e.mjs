@@ -483,6 +483,18 @@ test("registered users, profile settings, permissions, files, sharing, friends, 
     assert.equal(multipartBody.length, 5 * 1024 * 1024 + 4, "multipart upload should download intact");
     assert.equal(multipartBody.slice(-4), "tail", "multipart upload tail should be intact");
 
+    const r2DirectUpload = await app.request("/api/uploads/direct", {
+      method: "POST",
+      cookie: normalUser.cookie,
+      csrf: normalUser.csrf,
+      json: {
+        name: "r2-direct.txt",
+        size: 4,
+        contentType: "text/plain",
+      },
+    });
+    await expectJson(r2DirectUpload, 501, "R2 should not expose S3 direct upload URLs");
+
     const normalCannotAdmin = await app.request("/api/admin/overview", { cookie: normalUser.cookie });
     await expectJson(normalCannotAdmin, 403, "normal user cannot access admin overview");
 

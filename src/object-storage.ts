@@ -55,6 +55,12 @@ export interface MultipartUploadPart {
   etag: string;
 }
 
+export interface DirectUploadUrl {
+  url: string;
+  method: "PUT";
+  headers: Record<string, string>;
+}
+
 export interface ObjectStorageListOptions {
   prefix: string;
   cursor?: string;
@@ -80,6 +86,7 @@ export interface ObjectStorage {
   ): Promise<MultipartUploadPart>;
   completeMultipartUpload?(upload: MultipartUploadHandle, parts: MultipartUploadPart[]): Promise<void>;
   abortMultipartUpload?(upload: MultipartUploadHandle): Promise<void>;
+  createDirectUploadUrl?(key: string, options?: PutObjectOptions): Promise<DirectUploadUrl>;
 }
 
 class R2StoredObject implements StoredObject {
@@ -339,6 +346,26 @@ class S3ObjectStorage implements ObjectStorage {
     });
     if (response.status === 404) return;
     await this.assertOk(response, `abort multipart upload ${upload.key}`);
+  }
+
+  async createDirectUploadUrl(key: string, options?: PutObjectOptions) {
+    const headers: Record<string, string> = options?.contentType
+      ? {
+          "Content-Type": options.contentType,
+        }
+      : {};
+    const signed = await this.client.sign(this.objectUrl(key), {
+      method: "PUT",
+      headers,
+      aws: {
+        signQuery: true,
+      },
+    });
+    return {
+      url: signed.url,
+      method: "PUT" as const,
+      headers,
+    };
   }
 
   private bucketUrl() {
@@ -640,6 +667,13 @@ class D1StructuredStorage implements ObjectStorage {
   async abortMultipartUpload(upload: MultipartUploadHandle) {
     if (!this.objects.abortMultipartUpload) return;
     await this.objects.abortMultipartUpload(upload);
+  }
+
+  async createDirectUploadUrl(key: string, options?: PutObjectOptions) {
+    if (structuredKey(key) || !this.objects.createDirectUploadUrl) {
+      throw new Error("direct uploads are only supported for object data");
+    }
+    return this.objects.createDirectUploadUrl(key, options);
   }
 
   private async ensureReady() {

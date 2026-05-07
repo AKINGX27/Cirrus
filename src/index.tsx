@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { jsxRenderer } from "hono/jsx-renderer";
-import { createObjectStorage, storageLabel, type ObjectStorage, type StorageEnv } from "./object-storage";
+import { createObjectStorage, storageBackend, storageLabel, type ObjectStorage, type StorageEnv } from "./object-storage";
 import {
   addFriend,
   AppError,
@@ -1352,6 +1352,79 @@ app.post("/api/uploads/multipart", async (c) => {
         expiresAt: parseOptionalDate(body.expiresAt),
       },
     });
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
+
+app.post("/api/uploads/direct", async (c) => {
+  try {
+    const body = await jsonBody<{
+      name?: unknown;
+      size?: unknown;
+      contentType?: unknown;
+      description?: unknown;
+      tags?: unknown;
+      expiresAt?: unknown;
+    }>(c.req.raw, maxJsonBytes(c.env));
+    const size = typeof body.size === "number" && Number.isFinite(body.size) ? body.size : -1;
+    if (size < 0) throw new AppError("文件大小无效");
+    if (size > maxFileBytes(c.env)) throw new AppError("单个文件过大", 413);
+
+    if (storageBackend(c.env) !== "s3") throw new AppError("当前存储后端不支持直传", 501);
+    const storage = createObjectStorage(c.env);
+    if (!storage.createDirectUploadUrl) throw new AppError("当前存储后端不支持直传", 501);
+
+    const id = crypto.randomUUID();
+    const contentType = typeof body.contentType === "string" && body.contentType.trim() ? body.contentType : "application/octet-stream";
+    const upload = await storage.createDirectUploadUrl(objectKey(id), { contentType });
+    return c.json({
+      id,
+      upload,
+      file: {
+        name: typeof body.name === "string" ? body.name : "",
+        size,
+        contentType,
+        description: cleanDescription(body.description),
+        tags: cleanTags(body.tags),
+        expiresAt: parseOptionalDate(body.expiresAt),
+      },
+    });
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
+
+app.post("/api/uploads/direct/:id/complete", async (c) => {
+  try {
+    const id = c.req.param("id");
+    if (!isUuid(id)) throw new AppError("上传参数无效");
+    const body = await jsonBody<{
+      name?: unknown;
+      size?: unknown;
+      contentType?: unknown;
+      expiresAt?: unknown;
+      description?: unknown;
+      tags?: unknown;
+    }>(c.req.raw, maxJsonBytes(c.env));
+    const size = typeof body.size === "number" && Number.isFinite(body.size) ? body.size : -1;
+    if (size < 0) throw new AppError("文件大小无效");
+    if (size > maxFileBytes(c.env)) throw new AppError("单个文件过大", 413);
+
+    const storage = createObjectStorage(c.env);
+    const file = await createFileFromCompletedUpload(storage, {
+      id,
+      name: typeof body.name === "string" ? body.name : "",
+      size,
+      contentType: typeof body.contentType === "string" ? body.contentType : "",
+      expiresAt: parseOptionalDate(body.expiresAt),
+      description: cleanDescription(body.description),
+      tags: cleanTags(body.tags),
+      owner: c.get("session").name,
+    });
+    return c.json({ file: fileForClient(file) }, 201);
   } catch (error) {
     const { message, status } = jsonError(error);
     return errorResponse(message, status);
@@ -3476,7 +3549,9 @@ const clientScript = String.raw`
         const data = await response.json();
         message = data.error || message;
       } catch {}
-      throw new Error(message);
+      const error = new Error(message);
+      error.status = response.status;
+      throw error;
     }
 
     return response.json();
@@ -3548,13 +3623,16 @@ const clientScript = String.raw`
     });
   }
 
-  function requestWithProgress(method, path, body, onProgress) {
+  function requestWithProgress(method, path, body, onProgress, options = {}) {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open(method, path);
       xhr.responseType = "json";
-      xhr.withCredentials = true;
-      if (csrfToken) xhr.setRequestHeader("X-CSRF-Token", csrfToken);
+      xhr.withCredentials = options.withCredentials !== false;
+      if (options.csrf !== false && csrfToken) xhr.setRequestHeader("X-CSRF-Token", csrfToken);
+      for (const [name, value] of Object.entries(options.headers || {})) {
+        xhr.setRequestHeader(name, value);
+      }
       xhr.upload.addEventListener("progress", (event) => {
         if (event.lengthComputable && onProgress) onProgress(event.loaded, event.total);
       });
@@ -3592,6 +3670,43 @@ const clientScript = String.raw`
     context.doneBytes += item.file.size;
     updateUploadProgress(context.doneBytes, context.totalBytes);
     return data.files?.[0] || null;
+  }
+
+  async function storageDirectUploadFile(item, context) {
+    const file = item.file;
+    const create = await api("/api/uploads/direct", {
+      method: "POST",
+      body: JSON.stringify({
+        name: file.name,
+        size: file.size,
+        contentType: file.type || "application/octet-stream",
+        description: item.description,
+        tags: item.tags,
+        expiresAt: getExpiryValue()
+      })
+    });
+    const start = context.doneBytes;
+    await requestWithProgress(create.upload.method || "PUT", create.upload.url, file, (loaded) => {
+      updateUploadProgress(start + loaded, context.totalBytes);
+    }, {
+      withCredentials: false,
+      headers: create.upload.headers || {},
+      csrf: false
+    });
+    const completed = await api("/api/uploads/direct/" + encodeURIComponent(create.id) + "/complete", {
+      method: "POST",
+      body: JSON.stringify({
+        name: file.name,
+        size: file.size,
+        contentType: file.type || "application/octet-stream",
+        description: item.description,
+        tags: item.tags,
+        expiresAt: getExpiryValue()
+      })
+    }, 201);
+    context.doneBytes += file.size;
+    updateUploadProgress(context.doneBytes, context.totalBytes);
+    return completed.file;
   }
 
   async function multipartUploadFile(item, context) {
@@ -4267,7 +4382,12 @@ const clientScript = String.raw`
         if (item.file.size < Math.max(5 * 1024 * 1024, uploadLimits.chunkBytes || 16 * 1024 * 1024)) {
           await directUploadFile(item, uploadContext);
         } else {
-          await multipartUploadFile(item, uploadContext);
+          try {
+            await storageDirectUploadFile(item, uploadContext);
+          } catch (error) {
+            if (error.status !== 501 && !/不支持直传/.test(error.message || "")) throw error;
+            await multipartUploadFile(item, uploadContext);
+          }
         }
       }
       uploadProgress.value = 100;
