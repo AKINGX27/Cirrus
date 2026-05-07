@@ -214,7 +214,7 @@ admin:change-me:admin,alice:alice-password:user,bob:bob-password:user
 
 | 防护 | 说明 |
 | --- | --- |
-| HTTPS 安全头 | `Strict-Transport-Security`、`X-Content-Type-Options`、`Referrer-Policy`、`Permissions-Policy` 等 |
+| 基础安全头 | `X-Content-Type-Options`、`Referrer-Policy`、`Permissions-Policy` 等；HTTPS/HSTS 建议由 Cloudflare 橙云统一处理，避免代理环境兼容问题 |
 | CSP | 使用 nonce 限制脚本来源，禁止外站脚本、插件对象、跨站嵌入 |
 | CSRF | 所有登录后的写操作都必须携带同源页面生成的 `X-CSRF-Token` |
 | 同源校验 | 写操作会校验 `Origin` / `Referer`，并拒绝跨站 Fetch Metadata 子请求 |

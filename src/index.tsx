@@ -467,7 +467,6 @@ function safeResponseHeaders(nonce: string) {
     "base-uri 'none'",
     "form-action 'self'",
     "frame-ancestors 'none'",
-    "upgrade-insecure-requests",
   ].join("; ");
 
   return {
@@ -478,7 +477,6 @@ function safeResponseHeaders(nonce: string) {
     "Origin-Agent-Cluster": "?1",
     "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=(), fullscreen=(self), clipboard-write=(self)",
     "Referrer-Policy": "same-origin",
-    "Strict-Transport-Security": "max-age=63072000; includeSubDomains; preload",
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
     "X-Permitted-Cross-Domain-Policies": "none",
