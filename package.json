@@ -5,7 +5,6 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "predeploy": "node scripts/ensure-r2-bucket.mjs",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit"
   },

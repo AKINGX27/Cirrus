@@ -13,129 +13,126 @@
 - 分享支持免密码或密码分享、有效期、自定义或自动分享码
 - 浅色/暗色跟随系统，自适应宽屏和手机屏幕
 
-## Cloudflare Workers 部署
+## Cloudflare Workers 配置和部署
 
-本项目部署到 Cloudflare Workers，文件数据存储在 Cloudflare R2。部署脚本会自动读取 `wrangler.jsonc` 中的 `r2_buckets` 配置并创建 R2 bucket；bucket 已存在时会跳过创建并继续部署，不需要在 Cloudflare 控制台手动绑定。
+本项目部署为 Cloudflare Worker，文件存储使用 Cloudflare R2。不要创建 Pages 项目，也不需要提前手动创建 R2 bucket；`wrangler deploy` 会根据 `wrangler.jsonc` 自动创建并绑定 R2。
 
-### 1. 准备账号和本地环境
+部署前需要把项目推送到 GitHub 或 GitLab 仓库。Cloudflare Workers Builds 会从仓库读取 `package.json`、`wrangler.jsonc` 和 `src/index.tsx`。
 
-1. 注册并登录 Cloudflare 账号。
-2. 确认本机已安装 Node.js 20 或更高版本。
-3. 在项目目录安装依赖：
+### 1. Workers Builds 页面怎么填
 
-```bash
-npm install
-```
+进入 Cloudflare Dashboard -> `Workers & Pages` -> `Create application` -> `Import a repository`，选择本项目仓库后，按下表填写。
 
-4. 登录 Wrangler：
+| Cloudflare 页面输入框 | 应填写的值 | 说明 |
+| --- | --- | --- |
+| `Project name` / `Worker name` | `cirrus-drive` | 必须和 `wrangler.jsonc` 里的 `name` 一致 |
+| `Production branch` / `Branch` | `main` | 如果你的生产分支不是 `main`，填实际分支名 |
+| `Root directory` | 留空或填 `/` | 仓库根目录包含 `package.json` 和 `wrangler.jsonc` 时这样填 |
+| `Build command` | 留空 | 本项目没有单独的构建步骤 |
+| `Deploy command` | `npx wrangler deploy` | 由 Wrangler 读取配置、创建 R2、部署 Worker |
+| `Non-production branch deploy command` | 保持默认 | 默认通常是 `npx wrangler versions upload` |
+| `Environment variables` | 不填写 | 本项目没有运行时环境变量 |
+| `Secrets` | 不填写 | 本项目没有需要配置的密钥 |
 
-```bash
-npx wrangler login
-```
+如果项目放在 monorepo 子目录，`Root directory` 要填到包含 `package.json` 和 `wrangler.jsonc` 的目录，例如 `apps/cirrus`。
 
-命令会打开浏览器完成 Cloudflare 授权。如果账号下有多个 Cloudflare Account，后续创建 R2 bucket 或部署时按提示选择目标账号。
+### 2. `wrangler.jsonc` 配置说明
 
-### 2. 检查部署配置
-
-部署配置位于 `wrangler.jsonc`：
+当前配置如下：
 
 ```jsonc
 {
+  "$schema": "node_modules/wrangler/config-schema.json",
   "name": "cirrus-drive",
   "main": "src/index.tsx",
   "compatibility_date": "2026-05-03",
+  "observability": {
+    "enabled": true
+  },
   "r2_buckets": [
     {
-      "binding": "DRIVE_BUCKET",
-      "bucket_name": "cirrus-drive"
+      "binding": "DRIVE_BUCKET"
     }
   ]
 }
 ```
 
-字段说明：
+每一项的作用：
 
-- `name`：部署后的 Worker 名称。
-- `main`：Worker 入口文件。
-- `binding`：代码中使用的 R2 绑定名，当前代码使用 `DRIVE_BUCKET`，不要随意改名。
-- `bucket_name`：要创建并绑定的 R2 bucket 名称。
+| 配置项 | 当前值 | 作用 |
+| --- | --- | --- |
+| `name` | `cirrus-drive` | Worker 名称；Dashboard 里的项目名必须和它一致 |
+| `main` | `src/index.tsx` | Worker 入口文件 |
+| `compatibility_date` | `2026-05-03` | Workers 运行时兼容日期 |
+| `observability.enabled` | `true` | 开启 Cloudflare 观测日志和指标 |
+| `r2_buckets[0].binding` | `DRIVE_BUCKET` | 注入到 Worker 里的 R2 绑定变量名 |
 
-如需换 bucket 名称，只修改 `bucket_name` 即可。R2 bucket 名称建议使用小写字母、数字和短横线，长度保持在 3-63 个字符。
+代码中通过 `c.env.DRIVE_BUCKET` 访问 R2，所以 `binding` 必须保持为 `DRIVE_BUCKET`。如果改成其他名字，代码也要同步修改。
 
-### 3. 本地预览
+### 3. R2 自动创建规则
 
-```bash
-npm run dev
+这里故意没有写 `bucket_name`：
+
+```jsonc
+"r2_buckets": [
+  {
+    "binding": "DRIVE_BUCKET"
+  }
+]
 ```
 
-开发服务通常会启动在：
+这样 Wrangler 会启用 automatic provisioning。第一次执行 `npx wrangler deploy` 时，Cloudflare 会自动创建一个 R2 bucket，并把它绑定到 Worker 的 `DRIVE_BUCKET`。
+
+通过 Dashboard 的 Git 部署触发自动创建时，Cloudflare 会在后台保存这个自动创建的资源；资源 ID 不会写回你的 Git 仓库，这是正常现象。
+
+不要在 Cloudflare Dashboard 里提前手动创建 R2 bucket，也不要在 `wrangler.jsonc` 里补 `bucket_name`，除非你明确想绑定一个已有 bucket。
+
+### 4. 部署后怎么检查
+
+部署完成后，Cloudflare 会显示一个 `workers.dev` 地址，通常类似：
 
 ```text
-http://localhost:8787
+https://cirrus-drive.<你的-workers-子域>.workers.dev
 ```
 
-Wrangler 默认本地开发模式会把 R2 数据写入本地模拟存储，不会写入生产环境 bucket。你可以在页面中测试上传、下载、分享和批量 ZIP 下载。
+打开这个地址应能看到网盘首页。然后进入 Worker 的 `Settings` -> `Bindings`，确认有一条 R2 绑定：
 
-### 4. 首次部署
+| 检查项 | 正确值 |
+| --- | --- |
+| `Type` | `R2 bucket` |
+| `Variable name` / `Binding name` | `DRIVE_BUCKET` |
+| `Bucket` | Wrangler 自动创建的 bucket |
+| `Environment` | `Production` |
 
-```bash
-npm run deploy
+后续只要向生产分支推送代码，Workers Builds 会自动重新部署。
+
+### 5. 常见问题
+
+如果构建失败并提示 Worker 名称不匹配，确认 Dashboard 的 `Project name` / `Worker name` 和 `wrangler.jsonc` 的 `name` 都是 `cirrus-drive`。
+
+如果 R2 自动创建失败，确认 Cloudflare 账号拥有 Workers 和 R2 权限，并且仓库安装的 Wrangler 是 4.x。本项目已经在 `package.json` 中声明了 `wrangler` 4.x。
+
+如果页面能打开但文件列表或上传失败，检查 Worker 的 `Settings` -> `Bindings` 里是否存在 `DRIVE_BUCKET`。没有的话，重新触发一次部署，并确认 `Deploy command` 是 `npx wrangler deploy`。
+
+如果你想绑定已有 R2 bucket，可以在 `r2_buckets` 中加回 `bucket_name`，例如：
+
+```jsonc
+"r2_buckets": [
+  {
+    "binding": "DRIVE_BUCKET",
+    "bucket_name": "你的-bucket-name"
+  }
+]
 ```
 
-这个命令会依次执行：
-
-1. `predeploy`：运行 `scripts/ensure-r2-bucket.mjs`。
-2. 脚本读取 `wrangler.jsonc` 中的 `r2_buckets`。
-3. 自动执行 `wrangler r2 bucket create cirrus-drive`。
-4. 如果 bucket 已存在，脚本输出已存在并继续。
-5. 执行 `wrangler deploy`，将 Worker 部署到 Cloudflare。
-6. Wrangler 输出部署后的访问地址，通常是 `https://cirrus-drive.<你的子域>.workers.dev`。
-
-部署完成后，打开 Wrangler 输出的 URL。首页应直接显示网盘文件列表。
-
-### 5. 验证 R2 bucket 和部署状态
-
-查看当前账号下的 R2 bucket：
-
-```bash
-npx wrangler r2 bucket list
-```
-
-确认 Worker 已部署：
-
-```bash
-npx wrangler deployments list
-```
-
-也可以在 Cloudflare Dashboard 中进入 `Workers & Pages`，找到 `cirrus-drive`，查看部署记录和访问地址。
-
-### 6. 后续更新部署
-
-修改代码后重复执行：
-
-```bash
-npm run typecheck
-npm run deploy
-```
-
-`npm run deploy` 每次都会先确认 R2 bucket 是否存在。已存在时不会清空文件，也不会重建 bucket。
-
-### 7. 常见问题
-
-如果 `wrangler login` 无法打开浏览器，可以在终端输出的链接中手动复制到浏览器打开。
-
-如果部署时提示没有权限，请确认当前登录的 Cloudflare 账号拥有 Workers 和 R2 权限，或使用有权限的 API Token/账号重新登录。
-
-如果提示 bucket 名称无效，请把 `wrangler.jsonc` 的 `bucket_name` 改成只包含小写字母、数字和短横线的名称。
-
-如果 `workers.dev` 地址无法访问，请在 Cloudflare Dashboard 中确认账号已启用 Workers 子域，或为 Worker 绑定自定义域名。
+这种模式下需要你自己先创建对应的 R2 bucket。
 
 官方参考：
 
-- Cloudflare Workers Wrangler：<https://developers.cloudflare.com/workers/wrangler/>
-- Wrangler deploy：<https://developers.cloudflare.com/workers/wrangler/commands/workers/#deploy>
-- R2 bucket 创建：<https://developers.cloudflare.com/r2/buckets/create-buckets/>
-- Workers 使用 R2：<https://developers.cloudflare.com/r2/api/workers/workers-api-usage/>
+- Workers Builds：<https://developers.cloudflare.com/workers/ci-cd/builds/>
+- Workers Builds 配置：<https://developers.cloudflare.com/workers/ci-cd/builds/configuration/>
+- Wrangler 自动创建资源：<https://developers.cloudflare.com/workers/wrangler/configuration/#automatic-provisioning>
+- Workers 使用 R2 绑定：<https://developers.cloudflare.com/r2/api/workers/workers-api-reference/#create-a-binding>
 
 ## 项目结构
 

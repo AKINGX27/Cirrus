@@ -8,8 +8,7 @@
   },
   "r2_buckets": [
     {
-      "binding": "DRIVE_BUCKET",
-      "bucket_name": "cirrus-drive"
+      "binding": "DRIVE_BUCKET"
     }
   ]
 }
