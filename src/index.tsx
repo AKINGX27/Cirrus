@@ -2663,10 +2663,24 @@ button.tag-chip {
 }
 
 .file-picker {
+  display: grid;
+  gap: 8px;
   border: 1px dashed var(--line);
   border-radius: var(--radius);
   padding: 12px;
   background: var(--glass);
+}
+
+.file-picker input[type="file"] {
+  display: block;
+  min-height: 44px;
+  padding: 4px 12px;
+  line-height: 34px;
+}
+
+.file-picker input[type="file"]::file-selector-button {
+  min-height: 34px;
+  margin: 0 8px 0 0;
 }
 
 .upload-file-list {
@@ -2692,7 +2706,7 @@ button.tag-chip {
 
 .upload-file-meta {
   min-width: 0;
-  padding-top: 8px;
+  padding-top: 2px;
 }
 
 .upload-file-meta strong,
@@ -2710,13 +2724,14 @@ button.tag-chip {
 
 .upload-file-row textarea,
 .upload-file-row input {
-  min-height: 86px;
-  padding-top: 14px;
-  padding-bottom: 14px;
+  height: 44px;
+  min-height: 44px;
+  padding: 9px 12px;
+  line-height: 24px;
 }
 
-.upload-file-row input {
-  align-self: stretch;
+.upload-file-row textarea {
+  resize: none;
 }
 
 .upload-progress {
@@ -3615,7 +3630,7 @@ const clientScript = String.raw`
           '<strong></strong>' +
           '<small>' + formatSize(item.file.size) + '</small>' +
         '</span>' +
-        '<textarea maxlength="500" rows="3" placeholder="该文件的描述"></textarea>' +
+        '<textarea maxlength="500" rows="1" placeholder="该文件的描述"></textarea>' +
         '<input placeholder="该文件的标签" autocomplete="off" />';
       row.querySelector("strong").textContent = item.file.name;
       const textarea = row.querySelector("textarea");
