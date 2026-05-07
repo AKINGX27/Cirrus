@@ -1954,7 +1954,7 @@ function DriveApp({ storageName, session, nonce }: { storageName: string; sessio
         <form method="dialog" class="modal-panel" id="share-form">
           <header>
             <h2>创建分享</h2>
-            <button value="cancel" aria-label="关闭">×</button>
+            <button type="button" data-action="close-share-dialog" aria-label="关闭">×</button>
           </header>
           <label>
             <span>分享码</span>
@@ -1976,7 +1976,7 @@ function DriveApp({ storageName, session, nonce }: { storageName: string; sessio
             </div>
           </label>
           <footer>
-            <button value="cancel">取消</button>
+            <button type="button" data-action="close-share-dialog">取消</button>
             <button id="create-share-button" value="default">生成分享</button>
           </footer>
         </form>
@@ -4277,6 +4277,9 @@ const clientScript = String.raw`
   buttons.delete.addEventListener("click", () => deleteSelected().catch((error) => notify(error.message, "error")));
   buttons.paste.addEventListener("click", () => pasteClipboard().catch((error) => notify(error.message, "error")));
   copyShareLinkButton.addEventListener("click", () => copyShareLink().catch((error) => notify(error.message, "error")));
+  shareDialog.querySelectorAll('[data-action="close-share-dialog"]').forEach((button) => {
+    button.addEventListener("click", () => shareDialog.close());
+  });
   shareForm.addEventListener("submit", (event) => createShareFromDialog(event).catch((error) => notify(error.message, "error")));
 
   menu.addEventListener("click", (event) => {
