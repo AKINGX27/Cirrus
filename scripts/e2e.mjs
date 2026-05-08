@@ -654,8 +654,10 @@ test("registered users, profile settings, permissions, files, sharing, friends, 
     const shareHtml = await mf.dispatchFetch(`${origin}/s/qa-share`);
     const shareHtmlBody = await expectText(shareHtml, 200, "GET /s/:code");
     assertIncludes(shareHtmlBody, 'data-app="share"');
-    assertIncludes(shareHtmlBody, "<h1>分享文件</h1>");
+    assert.ok(!shareHtmlBody.includes("share-heading"), "share page should not render share-heading");
     assert.ok(!shareHtmlBody.includes("<h1>分享 qa-share</h1>"), "share page should not display share code in title");
+    assertIncludes(shareHtmlBody, 'id="share-context-menu" class="context-menu" hidden');
+    assertIncludes(shareHtmlBody, 'data-share-menu-action="download"');
 
     const lockedShare = await app.request("/api/shares/qa-share");
     const lockedBody = await expectJson(lockedShare, 200, "locked share read");
@@ -681,6 +683,36 @@ test("registered users, profile settings, permissions, files, sharing, friends, 
     });
     assert.equal(shareDownload.status, 200);
     assert.equal(await shareDownload.text(), "hello from alice");
+
+    const shareTicket = await app.request("/api/shares/qa-share/download-ticket", {
+      method: "POST",
+      json: { password: "share-pass", ids: [report.id] },
+    });
+    const shareTicketBody = await expectJson(shareTicket, 200, "share download ticket");
+    assert.match(shareTicketBody.url, /\/api\/shares\/qa-share\/download\?ticket=/);
+    const ticketDownload = await mf.dispatchFetch(shareTicketBody.url);
+    assert.equal(ticketDownload.status, 200);
+    assert.equal(await ticketDownload.text(), "hello from alice");
+
+    const shareAll = await app.api(
+      "/api/shares",
+      normalUser,
+      {
+        method: "POST",
+        json: { fileIds: [report.id, diagram.id], code: "qa-share-all" },
+      },
+      200,
+    );
+    assert.equal(shareAll.share.code, "qa-share-all");
+    const shareAllTicket = await app.request("/api/shares/qa-share-all/download-ticket", {
+      method: "POST",
+      json: { ids: [report.id, diagram.id] },
+    });
+    const shareAllTicketBody = await expectJson(shareAllTicket, 200, "share all download ticket");
+    const shareAllDownload = await mf.dispatchFetch(shareAllTicketBody.url);
+    assert.equal(shareAllDownload.status, 200);
+    assert.equal(shareAllDownload.headers.get("content-type"), "application/zip");
+    assert.ok((await shareAllDownload.arrayBuffer()).byteLength > 0, "share all download should contain zip bytes");
 
     const searchUsers = await app.api("/api/users/search?q=Root", normalUser);
     assert.ok(searchUsers.users.some((item) => item.name === "admin"));

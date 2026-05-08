@@ -42,6 +42,7 @@ import {
   type DirectMessage,
   type DriveFileMeta,
   type MergeMode,
+  type ShareRecord,
   type StoredUserAccount,
   type UserPasswordCredentials,
   type UserTagGrants,
@@ -102,10 +103,18 @@ const DEFAULT_AUTH_IDENTITY_RATE_LIMIT_PER_MINUTE = 20;
 const DEFAULT_SHARE_VERIFY_RATE_LIMIT_PER_MINUTE = 30;
 const SESSION_COOKIE = "cirrus_session";
 const SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 14;
+const SHARE_DOWNLOAD_TICKET_SECONDS = 120;
 
 interface RateBucket {
   count: number;
   resetAt: number;
+}
+
+interface ShareDownloadTicketPayload {
+  code: string;
+  ids: string[];
+  expiresAt: number;
+  nonce: string;
 }
 
 const rateBuckets =
@@ -401,6 +410,34 @@ function sessionSecret(env: Bindings) {
 async function csrfTokenForSession(env: Bindings, session: AuthSession) {
   const secret = sessionSecret(env);
   return hmacSha256Base64Url(secret, `csrf:${session.name}:${session.role}:${session.csrfSeed}`);
+}
+
+async function signShareDownloadTicket(env: Bindings, payload: ShareDownloadTicketPayload) {
+  const encoded = base64Url(new TextEncoder().encode(JSON.stringify(payload)));
+  const signature = await hmacSha256Base64Url(sessionSecret(env), encoded);
+  return `${encoded}.${signature}`;
+}
+
+async function verifyShareDownloadTicket(env: Bindings, value: string | null) {
+  if (!value) return null;
+  const [encoded, signature] = value.split(".");
+  if (!encoded || !signature) return null;
+  const expected = await hmacSha256Base64Url(sessionSecret(env), encoded);
+  if (!timingSafeEqual(signature, expected)) return null;
+
+  let payload: ShareDownloadTicketPayload;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(base64UrlToBytes(encoded)));
+  } catch {
+    return null;
+  }
+
+  if (typeof payload.code !== "string" || typeof payload.expiresAt !== "number" || typeof payload.nonce !== "string") {
+    return null;
+  }
+  if (!Array.isArray(payload.ids) || payload.ids.some((id) => typeof id !== "string" || !isUuid(id))) return null;
+  if (Date.now() > payload.expiresAt) return null;
+  return payload;
 }
 
 function parseCookies(request: Request) {
@@ -884,6 +921,30 @@ async function singleFileResponse(storage: ObjectStorage, file: DriveFileMeta) {
   });
 }
 
+async function filesForShareDownload(
+  storage: ObjectStorage,
+  share: ShareRecord,
+  ids: string[] | null,
+  maxIds: number,
+) {
+  const allFiles = await resolveShareFiles(storage, share);
+  const requestedIds = ids ? new Set(ids.slice(0, maxIds + 1)) : null;
+  if (requestedIds && requestedIds.size > maxIds) throw new AppError("选择的文件过多", 413);
+  const files = requestedIds ? allFiles.filter((file) => requestedIds.has(file.id)) : allFiles;
+  if (!files.length) throw new AppError("文件不存在", 404);
+  return files;
+}
+
+async function shareDownloadResponse(storage: ObjectStorage, share: ShareRecord, ids: string[] | null, maxIds: number) {
+  const files = await filesForShareDownload(storage, share, ids, maxIds);
+
+  if (files.length === 1) {
+    return singleFileResponse(storage, files[0]);
+  }
+
+  return zipResponse(storage, files, `Cirrus-share-${share.code}.zip`);
+}
+
 app.use(
   jsxRenderer(({ children }, c) => {
     const nonce = c.get("nonce");
@@ -945,7 +1006,10 @@ app.use("/api/*", async (c, next) => {
 
   const isPublicShareRead = c.req.method === "GET" && /^\/api\/shares\/[^/]+$/.test(path);
   const isPublicShareVerify = c.req.method === "POST" && /^\/api\/shares\/[^/]+\/verify$/.test(path);
-  const isPublicShareDownload = c.req.method === "POST" && /^\/api\/shares\/[^/]+\/download$/.test(path);
+  const isPublicShareDownload =
+    (c.req.method === "POST" || c.req.method === "GET") && /^\/api\/shares\/[^/]+\/download$/.test(path);
+  const isPublicShareDownloadTicket =
+    c.req.method === "POST" && /^\/api\/shares\/[^/]+\/download-ticket$/.test(path);
   const isAuthEndpoint = c.req.method === "POST" && /^\/api\/auth\/(?:login|register|logout)$/.test(path);
   if (isAuthEndpoint && !consumeRateLimit(`auth:${clientKey}`, authRateLimit(c.env))) {
     return rateLimitResponse();
@@ -953,10 +1017,19 @@ app.use("/api/*", async (c, next) => {
   if (isPublicShareVerify && !consumeRateLimit(`share-verify:${clientKey}:${path}`, shareVerifyRateLimit(c.env))) {
     return rateLimitResponse();
   }
-  if (isPublicShareDownload && !consumeRateLimit(`share-download:${clientKey}:${path}`, shareVerifyRateLimit(c.env))) {
+  if (
+    (isPublicShareDownload || isPublicShareDownloadTicket) &&
+    !consumeRateLimit(`share-download:${clientKey}:${path}`, shareVerifyRateLimit(c.env))
+  ) {
     return rateLimitResponse();
   }
-  if (isPublicShareRead || isPublicShareVerify || isPublicShareDownload || isAuthEndpoint) {
+  if (
+    isPublicShareRead ||
+    isPublicShareVerify ||
+    isPublicShareDownload ||
+    isPublicShareDownloadTicket ||
+    isAuthEndpoint
+  ) {
     await next();
     return;
   }
@@ -1734,15 +1807,61 @@ app.post("/api/shares/:code/download", async (c) => {
     const verified = await verifySharePassword(share, password);
     if (!verified) throw new AppError("密码不正确", 403);
 
-    const allFiles = await resolveShareFiles(storage, share);
-    const requestedIds = body.ids ? new Set(idsFromValue(body.ids, maxShareFiles(c.env))) : null;
-    const files = requestedIds ? allFiles.filter((file) => requestedIds.has(file.id)) : allFiles;
+    return shareDownloadResponse(
+      storage,
+      share,
+      body.ids ? idsFromValue(body.ids, maxShareFiles(c.env)) : null,
+      maxShareFiles(c.env),
+    );
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
 
-    if (files.length === 1) {
-      return singleFileResponse(storage, files[0]);
-    }
+app.post("/api/shares/:code/download-ticket", async (c) => {
+  try {
+    const body = await jsonBody<{ password?: unknown; ids?: unknown }>(c.req.raw, maxJsonBytes(c.env));
+    const ids = idsFromValue(body.ids, maxShareFiles(c.env));
+    const storage = createObjectStorage(c.env);
+    const share = await getShare(storage, c.req.param("code"));
+    if (!share) throw new AppError("分享不存在或已过期", 404);
 
-    return zipResponse(storage, files, `Cirrus-share-${share.code}.zip`);
+    const password = typeof body.password === "string" ? body.password : undefined;
+    const verified = await verifySharePassword(share, password);
+    if (!verified) throw new AppError("密码不正确", 403);
+    await filesForShareDownload(storage, share, ids, maxShareFiles(c.env));
+
+    return c.json({
+      url: new URL(
+        `/api/shares/${encodeURIComponent(share.code)}/download?ticket=${encodeURIComponent(
+          await signShareDownloadTicket(c.env, {
+            code: share.code,
+            ids,
+            expiresAt: Date.now() + SHARE_DOWNLOAD_TICKET_SECONDS * 1000,
+            nonce: randomToken(12),
+          }),
+        )}`,
+        c.req.url,
+      ).toString(),
+      expiresIn: SHARE_DOWNLOAD_TICKET_SECONDS,
+    });
+  } catch (error) {
+    const { message, status } = jsonError(error);
+    return errorResponse(message, status);
+  }
+});
+
+app.get("/api/shares/:code/download", async (c) => {
+  try {
+    const storage = createObjectStorage(c.env);
+    const share = await getShare(storage, c.req.param("code"));
+    if (!share) throw new AppError("分享不存在或已过期", 404);
+
+    const ticket = await verifyShareDownloadTicket(c.env, c.req.query("ticket") || null);
+    if (!ticket || ticket.code !== share.code) throw new AppError("下载链接已失效，请重新点击下载", 403);
+
+    return shareDownloadResponse(storage, share, ticket.ids, maxShareFiles(c.env));
   } catch (error) {
     const { message, status } = jsonError(error);
     return errorResponse(message, status);
@@ -2319,11 +2438,7 @@ function ShareApp({ code, nonce }: { code: string; nonce: string }) {
             <small>Shared files</small>
           </span>
         </a>
-        <div class="share-heading">
-          <p class="eyebrow">Share Link</p>
-          <h1>分享文件</h1>
-          <span id="share-expiry-note"></span>
-        </div>
+        <span id="share-expiry-note"></span>
         <form id="share-password-form" class="password-card" hidden>
           <input id="share-password-input" type="password" placeholder="输入分享密码" autocomplete="current-password" />
           <button>解锁</button>
@@ -2334,6 +2449,9 @@ function ShareApp({ code, nonce }: { code: string; nonce: string }) {
         </div>
         <div id="share-file-list" class="file-list shared"></div>
       </section>
+      <div id="share-context-menu" class="context-menu" hidden>
+        <button type="button" data-share-menu-action="download">下载</button>
+      </div>
       <script nonce={nonce} dangerouslySetInnerHTML={{ __html: shareClientScript }} />
     </main>
   );
@@ -3201,11 +3319,6 @@ button.tag-chip {
   padding: clamp(18px, 4vw, 34px);
   box-shadow: var(--shadow);
   backdrop-filter: blur(30px) saturate(1.4);
-}
-
-.share-heading {
-  display: grid;
-  gap: 6px;
 }
 
 .password-card {
@@ -4535,17 +4648,23 @@ const clientScript = String.raw`
     shareDialog.showModal();
   }
 
-  async function copyShareLink() {
+  async function copyShareLink(message = "复制成功") {
     const url = shareOutput.value.trim();
     if (!url) return;
     try {
-      await navigator.clipboard?.writeText(url);
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(url);
+      } else {
+        shareOutput.focus();
+        shareOutput.select();
+        if (!document.execCommand("copy")) throw new Error("复制失败");
+      }
     } catch {
       shareOutput.focus();
       shareOutput.select();
-      document.execCommand("copy");
+      if (!document.execCommand("copy")) throw new Error("复制失败");
     }
-    notify("分享链接已复制");
+    notify(message);
   }
 
   async function createShareFromDialog(event) {
@@ -4564,8 +4683,11 @@ const clientScript = String.raw`
     });
     shareOutput.value = data.share.url;
     copyShareLinkButton.disabled = false;
-    await copyShareLink().catch(() => {});
-    notify("分享链接已生成");
+    try {
+      await copyShareLink("分享链接已生成，复制成功");
+    } catch {
+      notify("分享链接已生成");
+    }
   }
 
   function renderPermissionForm() {
@@ -5110,7 +5232,8 @@ const shareClientScript = String.raw`
   const input = document.getElementById("share-password-input");
   const expiryNote = document.getElementById("share-expiry-note");
   const allButton = document.querySelector('[data-action="share-download-all"]');
-  const state = { files: [], password: "" };
+  const menu = document.getElementById("share-context-menu");
+  const state = { files: [], password: "", contextId: "", downloading: false };
 
   async function fetchShare() {
     status.textContent = "正在读取分享...";
@@ -5127,11 +5250,16 @@ const shareClientScript = String.raw`
 
     if (data.expiresAt) {
       expiryNote.textContent = "有效期至 " + new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(data.expiresAt));
+    } else {
+      expiryNote.textContent = "";
     }
 
     if (data.locked) {
       form.hidden = false;
+      state.files = [];
+      render();
       status.textContent = "该分享需要密码";
+      allButton.disabled = true;
       return;
     }
 
@@ -5162,6 +5290,7 @@ const shareClientScript = String.raw`
       const row = document.createElement("button");
       row.type = "button";
       row.className = "file-row";
+      row.dataset.id = file.id;
       row.innerHTML =
         '<span class="file-name">' +
           '<span class="file-icon">FILE</span>' +
@@ -5191,26 +5320,50 @@ const shareClientScript = String.raw`
         empty.textContent = "无标签";
         tags.append(empty);
       }
-      row.addEventListener("click", () => download([file.id]));
+      row.addEventListener("click", () => download([file.id]).catch((error) => {
+        state.downloading = false;
+        allButton.disabled = state.files.length === 0;
+        status.textContent = error.message;
+      }));
+      row.addEventListener("contextmenu", (event) => {
+        event.preventDefault();
+        state.contextId = file.id;
+        showMenu(event.clientX, event.clientY);
+      });
       list.append(row);
     }
     status.textContent = state.files.length ? state.files.length + " 个文件" : "分享中没有可下载文件";
-    allButton.disabled = state.files.length === 0;
+    allButton.disabled = state.files.length === 0 || state.downloading;
   }
 
-  function triggerBlobDownload(blob, fileName) {
-    const url = URL.createObjectURL(blob);
+  function hideMenu() {
+    state.contextId = "";
+    menu.hidden = true;
+  }
+
+  function showMenu(x, y) {
+    menu.hidden = false;
+    const rect = menu.getBoundingClientRect();
+    menu.style.left = Math.min(x, window.innerWidth - rect.width - 10) + "px";
+    menu.style.top = Math.min(y, window.innerHeight - rect.height - 10) + "px";
+  }
+
+  function triggerDownload(url) {
     const link = document.createElement("a");
     link.href = url;
-    link.download = fileName;
+    link.rel = "noopener";
     document.body.append(link);
     link.click();
     link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 500);
   }
 
   async function download(ids) {
-    const response = await fetch("/api/shares/" + encodeURIComponent(code) + "/download", {
+    if (!ids.length || state.downloading) return;
+    hideMenu();
+    state.downloading = true;
+    allButton.disabled = true;
+    status.textContent = ids.length === 1 ? "正在准备下载..." : "正在准备打包 " + ids.length + " 个文件...";
+    const response = await fetch("/api/shares/" + encodeURIComponent(code) + "/download-ticket", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ password: state.password, ids })
@@ -5219,9 +5372,17 @@ const shareClientScript = String.raw`
       const data = await response.json().catch(() => ({}));
       throw new Error(data.error || "下载失败");
     }
-    const single = ids.length === 1 ? state.files.find((file) => file.id === ids[0]) : null;
-    triggerBlobDownload(await response.blob(), single?.name || "Cirrus-share-" + code + ".zip");
-    setTimeout(fetchShare, 1200);
+    const data = await response.json().catch(() => ({}));
+    if (!data.url) throw new Error("下载链接生成失败");
+    triggerDownload(data.url);
+    status.textContent = "下载已开始";
+    setTimeout(() => {
+      state.downloading = false;
+      allButton.disabled = state.files.length === 0;
+      fetchShare().catch((error) => {
+        status.textContent = error.message;
+      });
+    }, 1200);
   }
 
   form.addEventListener("submit", (event) => {
@@ -5233,8 +5394,24 @@ const shareClientScript = String.raw`
   });
 
   allButton.addEventListener("click", () => download(state.files.map((file) => file.id)).catch((error) => {
+    state.downloading = false;
+    allButton.disabled = state.files.length === 0;
     status.textContent = error.message;
   }));
+
+  menu.addEventListener("click", (event) => {
+    const action = event.target.closest("button")?.dataset.shareMenuAction;
+    if (action !== "download" || !state.contextId) return;
+    download([state.contextId]).catch((error) => {
+      state.downloading = false;
+      allButton.disabled = state.files.length === 0;
+      status.textContent = error.message;
+    });
+  });
+
+  document.addEventListener("click", (event) => {
+    if (!event.target.closest(".context-menu")) hideMenu();
+  });
 
   fetchShare().catch((error) => {
     status.textContent = error.message;
