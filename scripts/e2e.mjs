@@ -686,11 +686,12 @@ test("registered users, profile settings, permissions, files, sharing, friends, 
 
     const shareTicket = await app.request("/api/shares/qa-share/download-ticket", {
       method: "POST",
-      json: { password: "share-pass", ids: [report.id] },
+      json: { password: "share-pass" },
     });
     const shareTicketBody = await expectJson(shareTicket, 200, "share download ticket");
-    assert.match(shareTicketBody.url, /\/api\/shares\/qa-share\/download\?ticket=/);
-    const ticketDownload = await mf.dispatchFetch(shareTicketBody.url);
+    assert.equal(typeof shareTicketBody.ticket, "string");
+    const ticketUrl = `${origin}/api/shares/qa-share/download?ticket=${encodeURIComponent(shareTicketBody.ticket)}&id=${encodeURIComponent(report.id)}`;
+    const ticketDownload = await mf.dispatchFetch(ticketUrl);
     assert.equal(ticketDownload.status, 200);
     assert.equal(await ticketDownload.text(), "hello from alice");
 
@@ -706,10 +707,13 @@ test("registered users, profile settings, permissions, files, sharing, friends, 
     assert.equal(shareAll.share.code, "qa-share-all");
     const shareAllTicket = await app.request("/api/shares/qa-share-all/download-ticket", {
       method: "POST",
-      json: { ids: [report.id, diagram.id] },
+      json: {},
     });
     const shareAllTicketBody = await expectJson(shareAllTicket, 200, "share all download ticket");
-    const shareAllDownload = await mf.dispatchFetch(shareAllTicketBody.url);
+    assert.equal(typeof shareAllTicketBody.ticket, "string");
+    const shareAllDownload = await mf.dispatchFetch(
+      `${origin}/api/shares/qa-share-all/download?ticket=${encodeURIComponent(shareAllTicketBody.ticket)}`,
+    );
     assert.equal(shareAllDownload.status, 200);
     assert.equal(shareAllDownload.headers.get("content-type"), "application/zip");
     assert.ok((await shareAllDownload.arrayBuffer()).byteLength > 0, "share all download should contain zip bytes");

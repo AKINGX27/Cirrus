@@ -27,6 +27,7 @@ import {
   renameFile,
   removeFriend,
   resolveShareFiles,
+  resolveShareFilesByIds,
   sendDirectMessage,
   setUserVisibleTags,
   updateOwnUserProfile,
@@ -112,7 +113,7 @@ interface RateBucket {
 
 interface ShareDownloadTicketPayload {
   code: string;
-  ids: string[];
+  allowedIds: string[];
   expiresAt: number;
   nonce: string;
 }
@@ -435,7 +436,7 @@ async function verifyShareDownloadTicket(env: Bindings, value: string | null) {
   if (typeof payload.code !== "string" || typeof payload.expiresAt !== "number" || typeof payload.nonce !== "string") {
     return null;
   }
-  if (!Array.isArray(payload.ids) || payload.ids.some((id) => typeof id !== "string" || !isUuid(id))) return null;
+  if (!Array.isArray(payload.allowedIds) || payload.allowedIds.some((id) => typeof id !== "string" || !isUuid(id))) return null;
   if (Date.now() > payload.expiresAt) return null;
   return payload;
 }
@@ -875,24 +876,33 @@ function renderAuthShellHtml(nonce: string) {
 </main>`;
 }
 
-async function zipResponse(storage: ObjectStorage, files: DriveFileMeta[], archiveName: string) {
-  if (!files.length) throw new AppError("文件不存在", 404);
-
-  const sources = [];
-  for (const file of files) {
-    const object = await storage.get(objectKey(file.id));
-    if (!object?.body) continue;
-    sources.push({
-      name: file.name,
-      size: file.size,
-      uploadedAt: file.uploadedAt,
-      body: object.body,
-    });
+async function incrementDownloads(storage: ObjectStorage, files: DriveFileMeta[], waitUntil?: (promise: Promise<unknown>) => void) {
+  const promise = Promise.all(files.map((file) => incrementDownload(storage, file.id))).then(() => undefined);
+  if (waitUntil) {
+    waitUntil(promise);
+    return;
   }
+  await promise;
+}
 
-  if (!sources.length) throw new AppError("文件不存在", 404);
+async function zipResponse(
+  storage: ObjectStorage,
+  files: DriveFileMeta[],
+  archiveName: string,
+  waitUntil?: (promise: Promise<unknown>) => void,
+) {
+  if (!files.length) throw new AppError("文件不存在", 404);
+  const sources = files.map((file) => ({
+    name: file.name,
+    size: file.size,
+    uploadedAt: file.uploadedAt,
+    body: async () => {
+      const object = await storage.get(objectKey(file.id));
+      return object?.body || null;
+    },
+  }));
 
-  await Promise.all(files.map((file) => incrementDownload(storage, file.id)));
+  await incrementDownloads(storage, files, waitUntil);
 
   return new Response(createStoredZipStream(sources), {
     headers: {
@@ -904,11 +914,15 @@ async function zipResponse(storage: ObjectStorage, files: DriveFileMeta[], archi
   });
 }
 
-async function singleFileResponse(storage: ObjectStorage, file: DriveFileMeta) {
+async function singleFileResponse(
+  storage: ObjectStorage,
+  file: DriveFileMeta,
+  waitUntil?: (promise: Promise<unknown>) => void,
+) {
   const object = await storage.get(objectKey(file.id));
   if (!object?.body) throw new AppError("文件不存在", 404);
 
-  await incrementDownload(storage, file.id);
+  await incrementDownloads(storage, [file], waitUntil);
 
   return new Response(object.body, {
     headers: {
@@ -921,28 +935,28 @@ async function singleFileResponse(storage: ObjectStorage, file: DriveFileMeta) {
   });
 }
 
-async function filesForShareDownload(
-  storage: ObjectStorage,
-  share: ShareRecord,
-  ids: string[] | null,
-  maxIds: number,
-) {
-  const allFiles = await resolveShareFiles(storage, share);
-  const requestedIds = ids ? new Set(ids.slice(0, maxIds + 1)) : null;
-  if (requestedIds && requestedIds.size > maxIds) throw new AppError("选择的文件过多", 413);
-  const files = requestedIds ? allFiles.filter((file) => requestedIds.has(file.id)) : allFiles;
+async function filesForShareDownload(storage: ObjectStorage, share: ShareRecord, ids: string[] | null, maxIds: number) {
+  const requestedIds = ids ? Array.from(new Set(ids.slice(0, maxIds + 1))) : null;
+  if (requestedIds && requestedIds.length > maxIds) throw new AppError("选择的文件过多", 413);
+  const files = requestedIds ? await resolveShareFilesByIds(storage, share, requestedIds) : await resolveShareFiles(storage, share);
   if (!files.length) throw new AppError("文件不存在", 404);
   return files;
 }
 
-async function shareDownloadResponse(storage: ObjectStorage, share: ShareRecord, ids: string[] | null, maxIds: number) {
+async function shareDownloadResponse(
+  storage: ObjectStorage,
+  share: ShareRecord,
+  ids: string[] | null,
+  maxIds: number,
+  waitUntil?: (promise: Promise<unknown>) => void,
+) {
   const files = await filesForShareDownload(storage, share, ids, maxIds);
 
   if (files.length === 1) {
-    return singleFileResponse(storage, files[0]);
+    return singleFileResponse(storage, files[0], waitUntil);
   }
 
-  return zipResponse(storage, files, `Cirrus-share-${share.code}.zip`);
+  return zipResponse(storage, files, `Cirrus-share-${share.code}.zip`, waitUntil);
 }
 
 app.use(
@@ -1682,7 +1696,7 @@ app.get("/api/files/:id/download", async (c) => {
     if (!(await visibleFiles(storage, c.get("session"))).some((item) => item.id === file.id)) {
       throw new AppError("文件不存在", 404);
     }
-    return singleFileResponse(storage, file);
+    return singleFileResponse(storage, file, c.executionCtx.waitUntil.bind(c.executionCtx));
   } catch (error) {
     const { message, status } = jsonError(error);
     return errorResponse(message, status);
@@ -1699,10 +1713,15 @@ app.post("/api/files/download", async (c) => {
     if (files.length !== ids.length) throw new AppError("文件不存在或无权下载", 404);
 
     if (files.length === 1) {
-      return singleFileResponse(storage, files[0]);
+      return singleFileResponse(storage, files[0], c.executionCtx.waitUntil.bind(c.executionCtx));
     }
 
-    return zipResponse(storage, files, `Cirrus-${new Date().toISOString().slice(0, 10)}.zip`);
+    return zipResponse(
+      storage,
+      files,
+      `Cirrus-${new Date().toISOString().slice(0, 10)}.zip`,
+      c.executionCtx.waitUntil.bind(c.executionCtx),
+    );
   } catch (error) {
     const { message, status } = jsonError(error);
     return errorResponse(message, status);
@@ -1765,6 +1784,13 @@ app.get("/api/shares/:code", async (c) => {
       code: share.code,
       expiresAt: share.expiresAt,
       files: files.map(fileForClient),
+      downloadTicket: await signShareDownloadTicket(c.env, {
+        code: share.code,
+        allowedIds: files.map((file) => file.id),
+        expiresAt: Date.now() + SHARE_DOWNLOAD_TICKET_SECONDS * 1000,
+        nonce: randomToken(12),
+      }),
+      downloadTicketExpiresIn: SHARE_DOWNLOAD_TICKET_SECONDS,
     });
   } catch (error) {
     const { message, status } = jsonError(error);
@@ -1789,6 +1815,13 @@ app.post("/api/shares/:code/verify", async (c) => {
       code: share.code,
       expiresAt: share.expiresAt,
       files: files.map(fileForClient),
+      downloadTicket: await signShareDownloadTicket(c.env, {
+        code: share.code,
+        allowedIds: files.map((file) => file.id),
+        expiresAt: Date.now() + SHARE_DOWNLOAD_TICKET_SECONDS * 1000,
+        nonce: randomToken(12),
+      }),
+      downloadTicketExpiresIn: SHARE_DOWNLOAD_TICKET_SECONDS,
     });
   } catch (error) {
     const { message, status } = jsonError(error);
@@ -1812,6 +1845,7 @@ app.post("/api/shares/:code/download", async (c) => {
       share,
       body.ids ? idsFromValue(body.ids, maxShareFiles(c.env)) : null,
       maxShareFiles(c.env),
+      c.executionCtx.waitUntil.bind(c.executionCtx),
     );
   } catch (error) {
     const { message, status } = jsonError(error);
@@ -1821,8 +1855,7 @@ app.post("/api/shares/:code/download", async (c) => {
 
 app.post("/api/shares/:code/download-ticket", async (c) => {
   try {
-    const body = await jsonBody<{ password?: unknown; ids?: unknown }>(c.req.raw, maxJsonBytes(c.env));
-    const ids = idsFromValue(body.ids, maxShareFiles(c.env));
+    const body = await jsonBody<{ password?: unknown }>(c.req.raw, maxJsonBytes(c.env));
     const storage = createObjectStorage(c.env);
     const share = await getShare(storage, c.req.param("code"));
     if (!share) throw new AppError("分享不存在或已过期", 404);
@@ -1830,20 +1863,16 @@ app.post("/api/shares/:code/download-ticket", async (c) => {
     const password = typeof body.password === "string" ? body.password : undefined;
     const verified = await verifySharePassword(share, password);
     if (!verified) throw new AppError("密码不正确", 403);
-    await filesForShareDownload(storage, share, ids, maxShareFiles(c.env));
+    const files = await resolveShareFiles(storage, share);
+    if (!files.length) throw new AppError("文件不存在", 404);
 
     return c.json({
-      url: new URL(
-        `/api/shares/${encodeURIComponent(share.code)}/download?ticket=${encodeURIComponent(
-          await signShareDownloadTicket(c.env, {
-            code: share.code,
-            ids,
-            expiresAt: Date.now() + SHARE_DOWNLOAD_TICKET_SECONDS * 1000,
-            nonce: randomToken(12),
-          }),
-        )}`,
-        c.req.url,
-      ).toString(),
+      ticket: await signShareDownloadTicket(c.env, {
+        code: share.code,
+        allowedIds: files.map((file) => file.id),
+        expiresAt: Date.now() + SHARE_DOWNLOAD_TICKET_SECONDS * 1000,
+        nonce: randomToken(12),
+      }),
       expiresIn: SHARE_DOWNLOAD_TICKET_SECONDS,
     });
   } catch (error) {
@@ -1860,8 +1889,12 @@ app.get("/api/shares/:code/download", async (c) => {
 
     const ticket = await verifyShareDownloadTicket(c.env, c.req.query("ticket") || null);
     if (!ticket || ticket.code !== share.code) throw new AppError("下载链接已失效，请重新点击下载", 403);
+    const selectedIds = c.req.queries("id") || [];
+    const requestedIds = selectedIds.length ? idsFromValue(selectedIds, maxShareFiles(c.env)) : ticket.allowedIds;
+    const allowedIds = new Set(ticket.allowedIds);
+    if (requestedIds.some((id) => !allowedIds.has(id))) throw new AppError("下载链接已失效，请重新点击下载", 403);
 
-    return shareDownloadResponse(storage, share, ticket.ids, maxShareFiles(c.env));
+    return shareDownloadResponse(storage, share, requestedIds, maxShareFiles(c.env), c.executionCtx.waitUntil.bind(c.executionCtx));
   } catch (error) {
     const { message, status } = jsonError(error);
     return errorResponse(message, status);
@@ -5233,7 +5266,7 @@ const shareClientScript = String.raw`
   const expiryNote = document.getElementById("share-expiry-note");
   const allButton = document.querySelector('[data-action="share-download-all"]');
   const menu = document.getElementById("share-context-menu");
-  const state = { files: [], password: "", contextId: "", downloading: false };
+  const state = { files: [], password: "", contextId: "", downloadTicket: "", ticketExpiresAt: 0, downloading: false };
 
   async function fetchShare() {
     status.textContent = "正在读取分享...";
@@ -5257,6 +5290,8 @@ const shareClientScript = String.raw`
     if (data.locked) {
       form.hidden = false;
       state.files = [];
+      state.downloadTicket = "";
+      state.ticketExpiresAt = 0;
       render();
       status.textContent = "该分享需要密码";
       allButton.disabled = true;
@@ -5265,6 +5300,8 @@ const shareClientScript = String.raw`
 
     form.hidden = true;
     state.files = data.files || [];
+    state.downloadTicket = data.downloadTicket || "";
+    state.ticketExpiresAt = Date.now() + Math.max(Number(data.downloadTicketExpiresIn || 0) - 15, 0) * 1000;
     render();
   }
 
@@ -5357,24 +5394,39 @@ const shareClientScript = String.raw`
     link.remove();
   }
 
-  async function download(ids) {
-    if (!ids.length || state.downloading) return;
-    hideMenu();
-    state.downloading = true;
-    allButton.disabled = true;
-    status.textContent = ids.length === 1 ? "正在准备下载..." : "正在准备打包 " + ids.length + " 个文件...";
+  async function ensureDownloadTicket() {
+    if (state.downloadTicket && Date.now() < state.ticketExpiresAt) return state.downloadTicket;
     const response = await fetch("/api/shares/" + encodeURIComponent(code) + "/download-ticket", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ password: state.password, ids })
+      body: JSON.stringify({ password: state.password })
     });
     if (!response.ok) {
       const data = await response.json().catch(() => ({}));
       throw new Error(data.error || "下载失败");
     }
     const data = await response.json().catch(() => ({}));
-    if (!data.url) throw new Error("下载链接生成失败");
-    triggerDownload(data.url);
+    if (!data.ticket) throw new Error("下载链接生成失败");
+    state.downloadTicket = data.ticket;
+    state.ticketExpiresAt = Date.now() + Math.max(Number(data.expiresIn || 0) - 15, 0) * 1000;
+    return state.downloadTicket;
+  }
+
+  function downloadUrl(ids, ticket) {
+    const url = new URL("/api/shares/" + encodeURIComponent(code) + "/download", location.origin);
+    url.searchParams.set("ticket", ticket);
+    for (const id of ids) url.searchParams.append("id", id);
+    return url.toString();
+  }
+
+  async function download(ids) {
+    if (!ids.length || state.downloading) return;
+    hideMenu();
+    state.downloading = true;
+    allButton.disabled = true;
+    status.textContent = ids.length === 1 ? "下载已开始" : "开始打包 " + ids.length + " 个文件";
+    const ticket = await ensureDownloadTicket();
+    triggerDownload(downloadUrl(ids, ticket));
     status.textContent = "下载已开始";
     setTimeout(() => {
       state.downloading = false;

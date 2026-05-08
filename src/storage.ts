@@ -369,7 +369,11 @@ export async function listFiles(storage: ObjectStorage) {
     });
 
     const batch = await Promise.all(
-      listed.objects.map(async (object) => normalizeFileMeta(await readJson<Partial<DriveFileMeta>>(storage, object.key))),
+      listed.objects.map(async (object) =>
+        normalizeFileMeta(
+          object.value !== undefined ? (object.value as Partial<DriveFileMeta>) : await readJson<Partial<DriveFileMeta>>(storage, object.key),
+        ),
+      ),
     );
 
     for (const meta of batch) {
@@ -1249,5 +1253,12 @@ export async function updateUserPassword(
 export async function resolveShareFiles(storage: ObjectStorage, share: ShareRecord) {
   return (
     await Promise.all(share.fileIds.map((id) => getActiveFileMeta(storage, id)))
+  ).filter(Boolean) as DriveFileMeta[];
+}
+
+export async function resolveShareFilesByIds(storage: ObjectStorage, share: ShareRecord, ids: string[]) {
+  const allowed = new Set(share.fileIds);
+  return (
+    await Promise.all(ids.map((id) => (allowed.has(id) ? getActiveFileMeta(storage, id) : null)))
   ).filter(Boolean) as DriveFileMeta[];
 }

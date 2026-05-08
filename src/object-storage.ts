@@ -68,7 +68,7 @@ export interface ObjectStorageListOptions {
 }
 
 export interface ObjectStorageListResult {
-  objects: Array<{ key: string }>;
+  objects: Array<{ key: string; value?: unknown }>;
   cursor?: string;
   truncated: boolean;
 }
@@ -578,10 +578,10 @@ const D1_COLUMN_SCHEMA = {
   ],
 } as const;
 
-class D1StructuredStorage implements ObjectStorage {
-  private schemaReady?: Promise<void>;
-  private legacyReady?: Promise<void>;
+const d1SchemaReady = new WeakMap<D1Database, Promise<void>>();
+const d1LegacyReady = new WeakMap<D1Database, Promise<void>>();
 
+class D1StructuredStorage implements ObjectStorage {
   constructor(
     private db: D1Database,
     private objects: ObjectStorage,
@@ -632,12 +632,12 @@ class D1StructuredStorage implements ObjectStorage {
     const limit = Math.min(options.limit ?? 1000, 1000);
     const offset = parseCursor(options.cursor);
     const result = await this.db
-      .prepare("SELECT id FROM file_meta ORDER BY uploaded_at DESC LIMIT ? OFFSET ?")
+      .prepare("SELECT * FROM file_meta ORDER BY uploaded_at DESC LIMIT ? OFFSET ?")
       .bind(limit, offset)
-      .all<{ id: string }>();
+      .all<FileMetaRow>();
 
     return {
-      objects: (result.results || []).map((row) => ({ key: metaKey(row.id) })),
+      objects: (result.results || []).map((row) => ({ key: metaKey(row.id), value: fileMetaFromRow(row) })),
       cursor: (result.results || []).length === limit ? String(offset + limit) : undefined,
       truncated: (result.results || []).length === limit,
     };
@@ -682,8 +682,15 @@ class D1StructuredStorage implements ObjectStorage {
   }
 
   private async ensureSchema() {
-    this.schemaReady ??= this.ensureSchemaReady();
-    await this.schemaReady;
+    let ready = d1SchemaReady.get(this.db);
+    if (!ready) {
+      ready = this.ensureSchemaReady().catch((error) => {
+        d1SchemaReady.delete(this.db);
+        throw error;
+      });
+      d1SchemaReady.set(this.db, ready);
+    }
+    await ready;
   }
 
   private async ensureSchemaReady() {
@@ -704,8 +711,15 @@ class D1StructuredStorage implements ObjectStorage {
   }
 
   private async migrateLegacyObjectJson() {
-    this.legacyReady ??= this.migrateLegacyObjectJsonOnce();
-    await this.legacyReady;
+    let ready = d1LegacyReady.get(this.db);
+    if (!ready) {
+      ready = this.migrateLegacyObjectJsonOnce().catch((error) => {
+        d1LegacyReady.delete(this.db);
+        throw error;
+      });
+      d1LegacyReady.set(this.db, ready);
+    }
+    await ready;
   }
 
   private async migrateLegacyObjectJsonOnce() {

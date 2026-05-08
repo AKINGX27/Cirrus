@@ -2,7 +2,7 @@ interface ZipSource {
   name: string;
   size: number;
   uploadedAt: string;
-  body: ReadableStream<Uint8Array>;
+  body: ReadableStream<Uint8Array> | (() => Promise<ReadableStream<Uint8Array> | null>);
 }
 
 interface CentralEntry {
@@ -164,6 +164,8 @@ export function createStoredZipStream(sources: ZipSource[]) {
             throw new Error("暂不支持超过 4GB 的 ZIP 下载");
           }
 
+          const body = typeof source.body === "function" ? await source.body() : source.body;
+          if (!body) continue;
           const { date, time } = dosDateTime(source.uploadedAt);
           const name = encoder.encode(uniqueName(source.name, usedNames));
           const localOffset = offset;
@@ -175,7 +177,7 @@ export function createStoredZipStream(sources: ZipSource[]) {
 
           let crc = 0xffffffff;
           let written = 0;
-          const reader = source.body.getReader();
+          const reader = body.getReader();
 
           try {
             while (true) {
