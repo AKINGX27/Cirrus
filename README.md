@@ -2,84 +2,87 @@
 
 **Language:** English | [简体中文](README_zh_ch.md)
 
-Cirrus Drive is a lightweight cloud drive built on Cloudflare Workers. It stores files in Cloudflare R2 by default, can use AWS S3 or S3-compatible storage, and stores structured data such as users, permissions, tags, shares, and messages in Cloudflare D1.
+Cirrus Drive is a lightweight, self-hosted cloud drive for Cloudflare Workers. It keeps the application layer serverless, stores files in R2 or S3-compatible object storage, and uses Cloudflare D1 for structured data such as users, permissions, tags, shares, and messages.
 
-## Features
+`Cloudflare Workers` · `R2 / S3` · `D1` · `Hono` · `Serverless file sharing`
 
-- Web login and registration. If no account exists, the first registered user becomes the administrator.
-- Personal file space where normal users see their own files by default.
-- Admin access to all files and a management page for roles, user tags, visible file tags, visible files, and notifications.
-- Upload one or many files with per-file description and tags.
-- File list with name, description, tags, upload time, last download time, and download count.
-- Search by file name, description, tag, and extension.
-- Click a tag to filter files by the same tag.
-- Single-file download and multi-file ZIP download.
-- Public share links with optional password, custom or automatic share code, and expiration time.
-- Public share page with single-file download, download all, and right-click download menu.
-- Rename files, edit descriptions, edit tags, copy, cut, select, download, and share from the file context menu.
-- Account settings for password, avatar, unique nickname, and status.
-- User search by username, nickname, and user tags.
-- Friends, private messages, and file sharing to friends.
-- Built-in security headers, CSP, CSRF protection, same-origin checks, rate limits, and upload size limits.
-- Responsive UI with system light/dark mode.
+## Feature Overview
 
-## Advantages
+| Area | Capabilities |
+| --- | --- |
+| Files | Multi-file upload, per-file description and tags, rename, copy, cut, delete, single-file download, streamed ZIP download for multiple files |
+| File list | Name, description, tags, upload time, last download time, download count, search by name / description / tag / extension, tag click filtering |
+| Sharing | Public share links, optional password, custom or generated share code, expiration time, single-file download, download all, right-click download on the share page |
+| Accounts | Built-in login and registration, password changes, avatar, unique nickname, status text |
+| Permissions | Normal users see their own files by default; admins can view all files and grant visibility by tag or by specific file |
+| Administration | Admin page for role changes, user tags, visible tags, visible files, and user notifications |
+| Social | User search by username, nickname, and user tags; friends, private messages, and file sharing to friends |
+| Security | Security headers, CSP, CSRF protection, same-origin checks, rate limits, upload limits, short-lived public download tickets |
+| Interface | Responsive layout with system light/dark mode |
 
-- **Lightweight:** no VPS, Docker, Nginx, or long-running backend service is required.
-- **Serverless:** the app runs as a Cloudflare Worker and scales on demand.
-- **Low maintenance:** frontend, API, auth, sharing, and admin tools live in one Worker project.
-- **Low cost:** files are stored in object storage, and structured metadata is small enough for D1.
-- **Data control:** you control the Worker, storage bucket, database, users, and permissions.
-- **Flexible storage:** choose R2 for the default Cloudflare-native setup or S3 for AWS and S3-compatible providers.
-- **Fine-grained visibility:** normal users see their own files; admins can grant visibility by tag or by specific file.
-- **Public-project friendly:** private domains, bucket names, database IDs, and secrets are not hardcoded in the repository.
-- **Easy to customize:** the codebase is small compared with full private-cloud suites such as Nextcloud or Seafile.
+If no configured or registered account exists, the first user who registers becomes the administrator. Later registrations become normal users by default.
+
+## Why Cirrus Drive
+
+| Advantage | What it means |
+| --- | --- |
+| Lightweight | No VPS, Docker, Nginx, or always-on backend process is required. |
+| Serverless | The app runs on Cloudflare Workers and scales with requests. |
+| Low maintenance | UI, API, auth, sharing, and administration live in one Worker project. |
+| Cost conscious | File data goes to object storage; structured metadata stays small and fits D1 well. |
+| Data ownership | You control the Worker, storage bucket, database, users, and permission rules. |
+| Storage flexibility | Use R2 for the default Cloudflare-native setup, or S3 for AWS and S3-compatible providers. |
+| Practical permissions | Admins can expose files by tag or by exact file without giving full account access. |
+| Public-repo friendly | Private domains, bucket names, database IDs, API tokens, and secrets are not hardcoded. |
+| Easy to adapt | Smaller and more focused than full private-cloud suites such as Nextcloud or Seafile. |
 
 ## Deploy With Cloudflare Workers Builds
 
-Deploy from the Cloudflare web dashboard when you want the simplest setup. Push this repository to GitHub or GitLab first.
+The recommended deployment path is Cloudflare Dashboard + Workers Builds. Push this repository to GitHub or GitLab first, then import it from the Cloudflare dashboard.
 
-### 1. Create The Worker From Git
+### 1. Create The Worker
 
 1. Open Cloudflare Dashboard.
 2. Go to `Workers & Pages`.
 3. Click `Create application`.
 4. Choose `Import a repository`.
-5. Select the repository that contains this project.
-6. Fill the build settings with the values below.
+5. Select the repository that contains Cirrus Drive.
+6. Fill in the build settings below.
 
-### 2. Choose R2 Or S3
+### 2. Choose A Storage Mode
 
-| Storage | Files stored in | Structured data | Deploy command | R2 auto-created |
+| Mode | File storage | Structured data | Deploy command | R2 provisioning |
 | --- | --- | --- | --- | --- |
-| Default R2 | Cloudflare R2 | Cloudflare D1 | `npm run deploy` | Yes |
-| S3 | AWS S3 or S3-compatible storage | Cloudflare D1 | `npm run deploy:s3` | No |
+| Default R2 | Cloudflare R2 | Cloudflare D1 | `npm run deploy` | Automatic |
+| S3 | AWS S3 or S3-compatible storage | Cloudflare D1 | `npm run deploy:s3` | Not used |
 
-R2 is the default. It needs no S3 variables. The repository intentionally omits R2 bucket names and D1 database IDs, so Wrangler automatic provisioning can create and bind resources for each deployment.
+R2 is the default mode. The R2 config intentionally omits bucket names and D1 database IDs so Wrangler automatic provisioning can create and bind resources during deployment.
 
-### 3. Workers Builds Fields
+S3 mode uses `wrangler.s3.jsonc`; it does not declare an R2 binding and will not create an R2 bucket.
 
-| Dashboard field | R2 value | S3 value | Notes |
+### 3. Fill Workers Builds Fields
+
+| Cloudflare field | R2 deployment | S3 deployment | Notes |
 | --- | --- | --- | --- |
-| `Project name` / `Worker name` | `cirrus-drive` | `cirrus-drive` | Keep it the same as `name` in the Wrangler config. |
-| `Production branch` | `main` | `main` | Use your real production branch if different. |
-| `Root directory` | empty or `/` | empty or `/` | If this project is in a monorepo, choose the folder containing `package.json`. |
-| `Build command` | empty | empty | There is no separate build command. |
-| `Deploy command` | `npm run deploy` | `npm run deploy:s3` | S3 uses `wrangler.s3.jsonc` and does not provision R2. |
-| `Non-production deploy command` | keep default | keep default | The default Worker preview upload is fine. |
+| `Project name` / `Worker name` | `cirrus-drive` | `cirrus-drive` | Keep this aligned with the Wrangler `name`. |
+| `Production branch` | `main` | `main` | Use your actual production branch if different. |
+| `Root directory` | empty or `/` | empty or `/` | For monorepos, choose the folder containing `package.json`. |
+| `Build command` | empty | empty | The Worker is bundled by Wrangler during deploy. |
+| `Deploy command` | `npm run deploy` | `npm run deploy:s3` | This is the important backend selector. |
+| `Non-production deploy command` | keep default | keep default | The default Worker preview command is fine. |
 
-### 4. Variables And Secrets
+### 4. Configure Variables And Secrets
 
-For R2, the minimal recommended setup is:
+Minimal R2 deployment:
 
-| Type | Name | Required | Example |
+| Type | Name | Required | Example / value |
 | --- | --- | --- | --- |
-| Secret | `CSRF_SECRET` | Recommended | a random long string |
+| Secret | `CSRF_SECRET` | Recommended | a stable random long string |
 | Secret | `AUTH_USERS` | Optional | `admin:change-me:admin,alice:alice-password:user` |
 
-For S3, add these in addition to `CSRF_SECRET`:
+S3 deployment also requires:
 
-| Type | Name | Required | Example |
+| Type | Name | Required | Example / value |
 | --- | --- | --- | --- |
 | Variable | `S3_BUCKET` | Yes | `my-drive-bucket` |
 | Variable | `S3_REGION` | Recommended | `us-east-1` |
@@ -89,25 +92,25 @@ For S3, add these in addition to `CSRF_SECRET`:
 | Variable | `S3_FORCE_PATH_STYLE` | Optional | `true` |
 | Secret | `S3_SESSION_TOKEN` | Optional | temporary session token |
 
-`AUTH_USERS` format:
+`AUTH_USERS` uses this format:
 
 ```text
 username:password:role,username:password:role
 ```
 
-Role must be `admin` or `user`. You may omit `AUTH_USERS`; when no configured or registered users exist, the first registered account becomes the administrator.
+Valid roles are `admin` and `user`. `AUTH_USERS` is optional; if it is not set and no registered account exists yet, the first registered user becomes the administrator.
 
 ### 5. Deploy
 
-After saving the Workers Builds configuration, trigger a production deploy from the dashboard or push to the production branch.
+After saving the Workers Builds configuration, trigger a production deployment in the dashboard or push to the production branch.
 
-R2 deploy uses `wrangler.jsonc`:
+R2 deployment:
 
 ```text
 npm run deploy
 ```
 
-S3 deploy uses `wrangler.s3.jsonc`:
+S3 deployment:
 
 ```text
 npm run deploy:s3
@@ -115,14 +118,15 @@ npm run deploy:s3
 
 ## Notes
 
-- Do not put private domains, bucket names, database IDs, API tokens, or secrets into the public repository.
-- `wrangler.jsonc` is for R2 and includes the `DRIVE_BUCKET` binding. `wrangler.s3.jsonc` is for S3 and does not include an R2 binding.
+- Do not commit private domains, bucket names, database IDs, API tokens, or secrets.
+- `wrangler.jsonc` is for R2 and includes the `DRIVE_BUCKET` binding.
+- `wrangler.s3.jsonc` is for S3 and intentionally has no R2 binding.
 - D1 is used for structured data in both R2 and S3 modes.
-- R2 and D1 resources are automatically provisioned by Wrangler when using the R2 config with the deploy command.
-- S3 buckets are not created by this project. Create the bucket yourself and give the Worker credentials with the required permissions.
-- `S3_REGION` should match the bucket region. If omitted, the app defaults to `us-east-1`, which can cause signing errors for buckets in other regions and may increase latency.
-- Cloudflare Orange Cloud / HTTPS can protect the domain in front of the Worker. The app also sends security headers and enforces CSRF and same-origin checks.
-- Keep `CSRF_SECRET` stable. Changing it invalidates existing sessions and CSRF tokens.
-- The first registered user is only automatically promoted when there are no configured or registered users.
-- Large files are stored in object storage. Multi-file downloads are streamed as ZIP files without compression.
-- Public share download links use short-lived tickets generated by the Worker.
+- R2 and D1 can be automatically provisioned by Wrangler when deploying with the R2 config.
+- S3 buckets are not created by Cirrus Drive. Create the bucket yourself and provide credentials with the required permissions.
+- `S3_REGION` should match the bucket region. If omitted, the app defaults to `us-east-1`, which may cause signing errors for buckets in other regions and can increase latency.
+- Keep `CSRF_SECRET` stable. Rotating it invalidates existing sessions and CSRF tokens.
+- The first-user-admin rule only applies when there are no configured or registered users.
+- Large files stay in object storage. Multi-file downloads are streamed as uncompressed ZIP archives.
+- Public share downloads use short-lived tickets generated by the Worker.
+- Cloudflare Orange Cloud and HTTPS can sit in front of the Worker; the app also applies its own security headers, CSRF checks, and same-origin validation.
