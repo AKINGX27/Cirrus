@@ -3949,15 +3949,15 @@ const clientScript = String.raw`
   }
 
   function ext(name) {
-    const match = name.match(/\\.([^.]+)$/);
+    const match = name.match(/\.([^.]+)$/);
     return match ? match[1].slice(0, 4).toUpperCase() : "FILE";
   }
 
   function parseTags(value) {
     const seen = new Set();
     const tags = [];
-    for (const raw of String(value || "").split(/[,，\\n]+/)) {
-      const tag = raw.replace(/[\\u0000-\\u001f\\u007f]+/g, " ").replace(/\\s+/g, " ").trim().slice(0, 32);
+    for (const raw of String(value || "").split(/[,，\n]+/)) {
+      const tag = raw.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 32);
       const key = tag.toLocaleLowerCase();
       if (!tag || seen.has(key)) continue;
       seen.add(key);
@@ -5046,8 +5046,8 @@ const adminClientScript = String.raw`
   function parseTags(value) {
     const seen = new Set();
     const tags = [];
-    for (const raw of String(value || "").split(/[,，\\n]+/)) {
-      const tag = raw.replace(/[\\u0000-\\u001f\\u007f]+/g, " ").replace(/\\s+/g, " ").trim().slice(0, 32);
+    for (const raw of String(value || "").split(/[,，\n]+/)) {
+      const tag = raw.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 32);
       const key = tag.toLocaleLowerCase();
       if (!tag || seen.has(key)) continue;
       seen.add(key);
